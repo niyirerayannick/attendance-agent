@@ -1,0 +1,22 @@
+[Unit]
+Description=EPCA ONE Hikvision attendance agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=epca-attendance
+Group=epca-attendance
+WorkingDirectory=/opt/epca-attendance-agent
+EnvironmentFile=/etc/epca-attendance-agent/environment
+ExecStart=/opt/epca-attendance-agent/venv/bin/python agent.py run
+Restart=on-failure
+RestartSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/epca-attendance-agent
+
+[Install]
+WantedBy=multi-user.target

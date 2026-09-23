@@ -1,0 +1,15 @@
+.git
+.env
+.env.*
+*.sqlite3
+*.sqlite3-*
+*.sqlite
+*.sqlite-*
+*.db
+*.db-*
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+tests/
+systemd/
