@@ -94,6 +94,44 @@ class AgentStore:
                 )
         return inserted, duplicates
 
+    def commit_discovery(self, events: Iterable[dict[str, Any]], cursor: int | None,
+                         state: dict[str, str | None] | None = None) -> tuple[int, int]:
+        """Queue events, optionally raise the cursor, and update/delete state keys in ONE transaction.
+
+        Unlike queue_events, the cursor only moves to the explicit ``cursor`` value, so a partial
+        backlog scan can queue events without skipping the older events it has not reached yet.
+        """
+        inserted = duplicates = 0
+        with self.connection:
+            for event in events:
+                result = self.connection.execute(
+                    """INSERT OR IGNORE INTO queued_events
+                    (serial_no, employee_no, event_time, major, minor, attendance_status,
+                     verification_method, raw_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (int(event["serial_no"]), event["employee_no"], event["event_time"], event.get("major"),
+                     event.get("minor"), event.get("attendance_status", ""), event.get("verification_method", ""),
+                     json.dumps(event["raw_payload"], separators=(",", ":")), _now()),
+                )
+                if result.rowcount:
+                    inserted += 1
+                else:
+                    duplicates += 1
+            if cursor is not None and cursor > self.discovery_cursor:
+                self.connection.execute(
+                    "INSERT INTO agent_state(key, value) VALUES ('last_discovered_serial', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(cursor),),
+                )
+            for key, value in (state or {}).items():
+                if value is None:
+                    self.connection.execute("DELETE FROM agent_state WHERE key = ?", (key,))
+                else:
+                    self.connection.execute(
+                        "INSERT INTO agent_state(key, value) VALUES (?, ?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value),
+                    )
+        return inserted, duplicates
+
     def pending_events(self, limit: int) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             "SELECT * FROM queued_events WHERE delivery_status = 'pending' ORDER BY serial_no LIMIT ?", (limit,)

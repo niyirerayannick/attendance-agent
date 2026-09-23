@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<UserInfoSearchCond xmlns="http://www.isapi.org/ver20/XMLSchema">
+    <searchID>1</searchID>
+    <maxResults>10</maxResults>
+</UserInfoSearchCond>

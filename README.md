@@ -13,7 +13,10 @@ The queue has `pending`, `delivered`, and `rejected` states. A malformed event r
 The agent uses these standard ISAPI endpoints with HTTP Digest authentication:
 
 * `GET /ISAPI/System/deviceInfo` for `test-device`.
-* `POST /ISAPI/AccessControl/AcsEvent?format=json` with `AcsEventCond` for event pages.
+* `POST /ISAPI/AccessControl/AcsEvent?format=json` with `AcsEventCond` for event pages. The body is exactly
+  `{"AcsEventCond": {"searchID": "1", "searchResultPosition": <n>, "maxResults": 10, "major": 5, "minor": 38}}`;
+  the DS-K1T8003MF (V1.3.37) rejects a UUID `searchID` or an oversized `maxResults` with `badParameters`.
+* `GET /ISAPI/AccessControl/AcsEvent/capabilities?format=json` for the read-only `event-capabilities` command.
 * `POST /ISAPI/AccessControl/UserInfo/Search?format=json` with `UserInfoSearchCond` for the optional `discover-users` diagnostic command.
 
 Hikvision firmware and terminal access-control configuration vary. Test the event search response on the terminal before enabling the systemd service. The event timestamp must include its timezone offset because the EPCA endpoint preserves and checks that offset. If a terminal returns local timestamps without an offset, correct the terminal timezone/NTP configuration first; the agent deliberately does not invent an offset.
@@ -59,7 +62,7 @@ sudo -u epca-attendance /opt/epca-attendance-agent/venv/bin/python agent.py sync
 sudo -u epca-attendance /opt/epca-attendance-agent/venv/bin/python agent.py health
 ```
 
-`test-cloud` posts an empty batch. EPCA returns the expected validation 400 only after it validates the device bearer token, so it sends no attendance event. `sync-once` first persists discovered events and then uploads pending events. `health` checks both connections and reports their status without exposing secrets. `discover-users` prints one device-user page and is for controlled HR mapping discovery.
+`test-cloud` posts an empty batch. EPCA returns the expected validation 400 only after it validates the device bearer token, so it sends no attendance event. `sync-once` first persists discovered events and then uploads pending events. `health` checks both connections and reports their status without exposing secrets. `discover-users` prints every device user (paged 10 at a time) and is for controlled HR mapping discovery. `event-capabilities` prints the terminal's supported `AcsEventCond` fields for diagnosis.
 
 Enable continuous operation:
 
@@ -73,7 +76,7 @@ journalctl -u epca-attendance-agent -f
 
 ## Failure and recovery
 
-The service retries temporary device/cloud failures with bounded exponential backoff, capped at one hour. It uses a one-hour delay immediately for 401/403 cloud authentication failures. Correct credentials or networking, then restart the service; the SQLite queue will resume. Do not delete the database to solve an upload issue, because that discards the durable discovery state. Back up `/var/lib/epca-attendance-agent/attendance-agent.sqlite3` only while the service is stopped or by using SQLite’s backup tooling.
+After each successful sync the service waits `POLL_INTERVAL_SECONDS` (1–86400; `5` gives near-real-time attendance). A failed cycle (Hikvision timeout, LAN outage, device reboot, EPCA outage, or any unexpected error) never stops `run`; it is logged and retried with a separate bounded exponential backoff of `RETRY_INITIAL_SECONDS` (default `5`) doubling up to `RETRY_MAX_SECONDS` (default `300`). The first successful cycle returns to the normal interval. All Hikvision calls share one persistent `requests.Session` with `HTTPDigestAuth`; if a request still ends in HTTP 401 after Digest negotiation (typically a stale nonce between polls), the session is recreated and the request retried exactly once before the cycle counts as failed. It uses a one-hour delay immediately for 401/403 cloud authentication failures. Correct credentials or networking, then restart the service; the SQLite queue will resume. Do not delete the database to solve an upload issue, because that discards the durable discovery state. Back up `/var/lib/epca-attendance-agent/attendance-agent.sqlite3` only while the service is stopped or by using SQLite’s backup tooling.
 
 For an upgrade, stop the service, back up the SQLite file, replace `/opt/epca-attendance-agent`, update dependencies in the existing virtual environment, then start the service. Keep the database path unchanged. `journalctl -u epca-attendance-agent -f` is the first place to investigate a device or cloud error; run `health`, then `test-device` and `test-cloud` after correcting network or credential settings.
 
@@ -117,8 +120,25 @@ AGENT_DATA_DIR=/data
 
 Optional settings are `HIKVISION_SCHEME` (default `http`), `HIKVISION_VERIFY_TLS` (default
 `true`), `DEVICE_TIMEOUT_SECONDS`, `CLOUD_TIMEOUT_SECONDS`, `BATCH_SIZE`, `EVENT_PAGE_SIZE`, and
-`MAX_PAGES_PER_POLL`. `AGENT_DATABASE_PATH=/data/attendance_agent.db` can override the default,
+`MAX_PAGES_PER_POLL` (default `EVENT_PAGE_SIZE=10`), `RETRY_INITIAL_SECONDS` / `RETRY_MAX_SECONDS` (default `5` / `300`), `HIKVISION_EVENT_MAJOR` / `HIKVISION_EVENT_MINOR`
+(default `5` / `38`, fingerprint verified), and the initial-sync settings below. `AGENT_DATABASE_PATH=/data/attendance_agent.db` can override the default,
 but should remain inside the persistent volume. EPCA HTTPS certificate verification is always on.
+
+### First start: recent events only
+
+The terminal keeps its whole event log (tens of thousands of events back to 2022). With an empty
+database the agent does **not** import that history. The first poll reads `totalMatches`, walks back
+from the newest page, and queues only events from the last `INITIAL_SYNC_LOOKBACK_HOURS` (default `24`;
+`0` queues nothing), capped at `INITIAL_SYNC_MAX_EVENTS` (default `1000`) in case the terminal clock is
+wrong. The highest `serialNo` seen becomes the durable cursor, and later polls queue only newer
+events. The agent uses only `AcsEventCond` fields proven on this firmware, so the window is applied to
+the event `time` locally rather than through `startTime`/`endTime`. Timestamps are stored exactly as
+the device reports them (for example `+08:00`) and are not converted.
+
+`INITIAL_SYNC_FULL_HISTORY=true` (default `false`) imports the full history instead, at most
+`MAX_PAGES_PER_POLL` pages per poll. Set it only before the first start and only when EPCA ONE should
+receive every historical event. EPCA ONE deduplicates on device plus serial number, so re-sent events
+are safe.
 
 The image starts `python agent.py run`; no ports are exposed. Docker runs the existing
 `python agent.py health` every 60 seconds after a 90-second start period. The health command

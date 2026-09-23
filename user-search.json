@@ -1,0 +1,12 @@
+{
+  "UserInfoSearchCond": {
+    "searchID": "1",
+    "searchResultPosition": 0,
+    "maxResults": 10,
+    "EmployeeNoList": [
+      {
+        "employeeNo": "93"
+      }
+    ]
+  }
+}
