@@ -118,6 +118,16 @@ POLL_INTERVAL_SECONDS=60
 AGENT_DATA_DIR=/data
 ```
 
+### Local `.env` file (native Windows or development)
+
+`python agent.py <command>` automatically loads a `.env` file located **next to `agent.py`** (resolved
+from the script location, not the current working directory, so a Windows Service finds it too).
+Real OS environment variables always take precedence over `.env` values (`override=False`); in
+Docker/Coolify no `.env` is needed. Copy `.env.example` to `.env` and fill in real values; `.env` is
+git- and docker-ignored and must never be committed. Only the path of the loaded file is logged.
+On Windows set `AGENT_DATA_DIR` to a full path such as `C:\EPCAttendance-agent\data`; when unset
+it defaults to a `data` folder next to `agent.py` (and to `/data` on Linux).
+
 Optional settings are `HIKVISION_SCHEME` (default `http`), `HIKVISION_VERIFY_TLS` (default
 `true`), `DEVICE_TIMEOUT_SECONDS`, `CLOUD_TIMEOUT_SECONDS`, `BATCH_SIZE`, `EVENT_PAGE_SIZE`, and
 `MAX_PAGES_PER_POLL` (default `EVENT_PAGE_SIZE=10`), `RETRY_INITIAL_SECONDS` / `RETRY_MAX_SECONDS` (default `5` / `300`), `HIKVISION_EVENT_MAJOR` / `HIKVISION_EVENT_MINOR`

@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 if __package__ in {None, ""}:  # supports the documented `python agent.py ...` command
@@ -19,17 +20,20 @@ if __package__ in {None, ""}:  # supports the documented `python agent.py ...` c
 
 try:  # Package imports work inside EPCA ONE until this directory is extracted.
     from attendance_agent.cloud import CloudAuthenticationError, CloudError, EpcClient
-    from attendance_agent.config import AgentConfig, ConfigurationError
+    from attendance_agent.config import AgentConfig, ConfigurationError, load_project_env
     from attendance_agent.hikvision import DeviceError, HikvisionClient
     from attendance_agent.storage import AgentStore
 except ModuleNotFoundError:  # Standalone repository: modules live beside agent.py.
     from cloud import CloudAuthenticationError, CloudError, EpcClient
-    from config import AgentConfig, ConfigurationError
+    from config import AgentConfig, ConfigurationError, load_project_env
     from hikvision import DeviceError, HikvisionClient
     from storage import AgentStore
 
 
 LOG = logging.getLogger("epca_attendance_agent")
+
+# Directory of the launched agent.py, independent of the working directory (e.g. a Windows Service).
+APP_DIR = Path(__file__).resolve().parent
 
 # agent_state keys for event discovery (all durable in SQLite alongside last_discovered_serial).
 BOOTSTRAP_STATE_KEY = "event_bootstrap_complete"
@@ -308,7 +312,8 @@ def main() -> int:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
-        agent = AttendanceAgent(AgentConfig.from_environment())
+        load_project_env(APP_DIR / ".env")  # real environment variables take precedence
+        agent = AttendanceAgent(AgentConfig.from_environment(app_dir=APP_DIR))
         if args.command == "test-device":
             print(agent.test_device())
         elif args.command == "test-cloud":

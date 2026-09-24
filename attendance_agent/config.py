@@ -1,11 +1,19 @@
-"""Configuration loaded only from the agent process environment."""
+"""Configuration loaded from the process environment, optionally seeded from the project .env file."""
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+
+LOG = logging.getLogger("epca_attendance_agent.config")
+
+# Fallback project directory, resolved from __file__ and never from the working directory, so a Windows
+# Service (working directory usually C:\Windows\System32) still finds it. agent.py passes its own
+# directory explicitly, because `python agent.py` may import this module from the nested package copy.
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 class ConfigurationError(ValueError):
@@ -13,6 +21,40 @@ class ConfigurationError(ValueError):
 
 
 MAX_POLL_INTERVAL_SECONDS = 86_400
+
+
+def load_project_env(env_file: str | os.PathLike[str] | None = None) -> bool:
+    """Load KEY=VALUE pairs from the project .env into os.environ without overriding real env vars.
+
+    Returns True when a file was loaded. Only the file path is logged, never keys or values.
+    """
+    path = Path(env_file) if env_file is not None else PROJECT_ROOT / ".env"
+    if not path.is_file():
+        LOG.debug("No .env file at %s; using the process environment only.", path)
+        return False
+    try:
+        from dotenv import load_dotenv
+    except ModuleNotFoundError as exc:
+        raise ConfigurationError("python-dotenv is required to read .env; run: pip install -r requirements.txt") from exc
+    load_dotenv(dotenv_path=path, override=False)  # OS environment variables always win
+    LOG.info("Loaded configuration defaults from %s.", path)
+    return True
+
+
+def default_data_dir(app_dir: Path | None = None) -> Path:
+    """/data inside the Linux container; <app_dir>\\data when running natively on Windows."""
+    return (app_dir or PROJECT_ROOT) / "data" if os.name == "nt" else Path("/data")
+
+
+def _path_setting(name: str) -> Path | None:
+    value = os.getenv(name, "").strip().strip('"')
+    if not value:
+        return None
+    path = Path(os.path.expandvars(value)).expanduser()
+    if os.name == "nt" and path.root and not path.drive:
+        LOG.warning("%s=%s has no drive letter; on Windows it resolves to %s. Use a full path such as "
+                    r"C:\EPCA\attendance-agent\data.", name, value, path.resolve())
+    return path
 
 
 def _required(name: str) -> str:
@@ -90,7 +132,7 @@ class AgentConfig:
         return f"{self.hikvision_scheme}://{self.hikvision_host}".rstrip("/")
 
     @classmethod
-    def from_environment(cls) -> "AgentConfig":
+    def from_environment(cls, app_dir: Path | None = None) -> "AgentConfig":
         scheme = os.getenv("HIKVISION_SCHEME", "http").lower().strip()
         if scheme not in {"http", "https"}:
             raise ConfigurationError("HIKVISION_SCHEME must be http or https.")
@@ -106,10 +148,8 @@ class AgentConfig:
             epca_device_code=_required("EPCA_DEVICE_CODE").upper(),
             epca_device_token=_required("EPCA_DEVICE_TOKEN"),
             poll_interval_seconds=_positive_int("POLL_INTERVAL_SECONDS", 60),
-            database_path=os.getenv(
-                "AGENT_DATABASE_PATH",
-                str(Path(os.getenv("AGENT_DATA_DIR", "/data")) / "attendance_agent.db"),
-            ),
+            database_path=str(_path_setting("AGENT_DATABASE_PATH")
+                              or (_path_setting("AGENT_DATA_DIR") or default_data_dir(app_dir)) / "attendance_agent.db"),
             hikvision_scheme=scheme,
             hikvision_verify_tls=_boolean("HIKVISION_VERIFY_TLS", True),
             device_timeout_seconds=_positive_int("DEVICE_TIMEOUT_SECONDS", 15),
