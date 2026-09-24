@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from typing import Any, Callable
 
 import requests
@@ -32,11 +34,43 @@ ACS_EVENT_SEARCH_ID = "1"
 USER_SEARCH_MAX_PAGES = 5000
 
 # Only these fields from a Hikvision error body are ever logged; everything else is discarded.
-_ERROR_FIELDS = ("statusCode", "statusString", "subStatusCode", "errorCode", "errorMsg")
+_ERROR_FIELDS = ("statusCode", "statusString", "subStatusCode", "errorCode", "errorMsg",
+                 "lockStatus", "unlockTime", "retryLoginTime")
+
+# Fields of the <userCheck>/ResponseStatus body a Hikvision 401 carries, e.g. while the account is locked:
+# <statusValue>401</statusValue><statusString>Unauthorized</statusString><lockStatus>lock</lockStatus>
+# <unlockTime>1795</unlockTime><retryLoginTime>0</retryLoginTime>
+_AUTH_FIELDS = ("statusValue", "statusString", "lockStatus", "unlockTime", "retryLoginTime")
+# A device-reported unlockTime outside 1..MAX_LOCK_SECONDS is treated as unknown.
+MAX_LOCK_SECONDS = 86_400
+# Consecutive ordinary authentication failures double the cooldown up to this ceiling.
+MAX_AUTH_COOLDOWN_SECONDS = 3_600
 
 
 class DeviceError(RuntimeError):
     pass
+
+
+class DeviceCooldownError(DeviceError):
+    """Device requests are paused; ``retry_after`` is the number of seconds until one is permitted again."""
+    kind = "cooldown"
+
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class DeviceLockedError(DeviceCooldownError):
+    """The device reported lockStatus=lock for the configured account."""
+    kind = "lock"
+
+
+class DeviceAuthenticationError(DeviceCooldownError):
+    """HTTP 401 persisted after the single fresh-session recovery attempt."""
+    kind = "auth"
+
+
+_COOLDOWN_ERRORS = {cls.kind: cls for cls in (DeviceLockedError, DeviceAuthenticationError)}
 
 
 DEVICE_INFO_FIELDS = ("deviceName", "deviceID", "model", "serialNumber", "macAddress",
@@ -101,6 +135,60 @@ def _clean_error_value(value: Any) -> str:
     return " ".join(str(value).split())[:200]
 
 
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass(frozen=True)
+class AuthFailure:
+    """The lockout-relevant part of a Hikvision HTTP 401 body; never contains credentials."""
+    locked: bool = False
+    unlock_seconds: int | None = None  # device-reported remaining lock time, only when plausible
+    retries_left: int | None = None  # retryLoginTime: login attempts left before the device locks
+    status: str = ""
+
+
+def _collect_auth_fields(node: Any, fields: dict[str, str]) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in _AUTH_FIELDS and not isinstance(value, (dict, list)):
+                fields.setdefault(key, str(value).strip())
+            else:
+                _collect_auth_fields(value, fields)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_auth_fields(item, fields)
+
+
+def parse_auth_failure(body: bytes | str | None) -> AuthFailure:
+    """Parse a Hikvision 401 body (XML <userCheck>/<ResponseStatus>, or JSON); unknown shapes are ordinary 401s."""
+    raw = (body.encode("utf-8") if isinstance(body, str) else body or b"").lstrip(_LEADING_JUNK)
+    fields: dict[str, str] = {}
+    if raw.startswith(b"{"):
+        try:
+            _collect_auth_fields(json.loads(raw), fields)
+        except (ValueError, TypeError):
+            pass
+    elif raw.startswith(b"<") and b"<!DOCTYPE" not in raw and b"<!ENTITY" not in raw:
+        try:
+            for element in ET.fromstring(raw).iter():
+                name = _local_name(element.tag)
+                if name in _AUTH_FIELDS and len(element) == 0:
+                    fields.setdefault(name, (element.text or "").strip())
+        except ET.ParseError:
+            pass
+    unlock = _safe_int(fields.get("unlockTime"))
+    return AuthFailure(
+        locked=fields.get("lockStatus", "").lower() == "lock",
+        unlock_seconds=unlock if unlock is not None and 0 < unlock <= MAX_LOCK_SECONDS else None,
+        retries_left=_safe_int(fields.get("retryLoginTime")),
+        status=_clean_error_value(fields.get("statusString", "")),
+    )
+
+
 def _describe_http_error(method: str, path: str, response: Any) -> str:
     """Summarise a failed ISAPI call using only whitelisted ResponseStatus fields (never headers)."""
     parts = [f"{method} {path}", f"HTTP {getattr(response, 'status_code', '?')}"]
@@ -126,12 +214,21 @@ def _describe_http_error(method: str, path: str, response: Any) -> str:
 
 class HikvisionClient:
     def __init__(self, config: AgentConfig, session: requests.Session | None = None,
-                 session_factory: Callable[[], requests.Session] | None = None):
+                 session_factory: Callable[[], requests.Session] | None = None,
+                 clock: Callable[[], float] = time.monotonic):
         self.config = config
         # An injected session (tests) is reused on recovery unless a factory is also supplied.
         self._session_factory = session_factory or ((lambda: session) if session is not None else requests.Session)
         # One lock serialises requests and session replacement, so a swap never races an in-flight request.
         self._lock = threading.RLock()
+        self._clock = clock
+        # While clock() < _cooldown_until no request of any kind is sent to the device.
+        self._cooldown_until = 0.0
+        self._cooldown_kind = ""
+        self._fresh_session_due = False  # the first request after a cooldown uses a brand-new session
+        self._auth_failures = 0
+        # Optional hook(seconds, kind) so the agent can persist a cooldown across restarts.
+        self.on_cooldown: Callable[[float, str], None] | None = None
         self.session = self._new_session()
 
     def _new_session(self) -> requests.Session:
@@ -151,19 +248,98 @@ class HikvisionClient:
                 except Exception:  # closing a dead pool must never break recovery
                     pass
 
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self.session.close()
+            except Exception:
+                pass
+
+    def cooldown_remaining(self) -> float:
+        return max(0.0, self._cooldown_until - self._clock())
+
+    def pause(self, seconds: float, kind: str = "auth") -> None:
+        """Send no device request for ``seconds`` (e.g. restoring a lockout recorded before a restart)."""
+        with self._lock:
+            self._start_cooldown(seconds, kind)
+
+    def _start_cooldown(self, seconds: float, kind: str) -> None:
+        self._cooldown_until = max(self._cooldown_until, self._clock() + seconds)
+        self._cooldown_kind = kind
+        self._fresh_session_due = True
+
+    def _check_cooldown(self) -> bool:
+        """Raise while paused; return True when this is the first request after a cooldown ended."""
+        remaining = self.cooldown_remaining()
+        if remaining > 0:
+            error = _COOLDOWN_ERRORS.get(self._cooldown_kind, DeviceAuthenticationError)
+            reason = "account locked" if error is DeviceLockedError else "authentication cooldown"
+            LOG.debug("Hikvision request skipped: %s for approximately %s more seconds.", reason, round(remaining))
+            raise error(f"Hikvision requests paused ({reason}) for approximately {round(remaining)} more seconds.",
+                        remaining)
+        if not self._fresh_session_due:
+            return False
+        self._fresh_session_due = False
+        LOG.info("Hikvision cooldown finished; trying one request with a fresh authentication session.")
+        self.reset_session()
+        return True
+
+    def _enter_cooldown(self, error: type[DeviceCooldownError], seconds: float, message: str) -> DeviceCooldownError:
+        self._start_cooldown(seconds, error.kind)
+        LOG.warning("%s", message)
+        if self.on_cooldown is not None:
+            try:
+                self.on_cooldown(seconds, error.kind)
+            except Exception:  # persisting the cooldown is best effort; the in-memory pause still holds
+                LOG.debug("Could not record the Hikvision cooldown.", exc_info=True)
+        return error(message, seconds)
+
+    def _lock_cooldown(self, failure: AuthFailure) -> DeviceCooldownError:
+        base = failure.unlock_seconds if failure.unlock_seconds is not None else self.config.hikvision_lock_default_seconds
+        seconds = base + self.config.hikvision_lock_margin_seconds
+        return self._enter_cooldown(
+            DeviceLockedError, seconds,
+            f"Hikvision account locked; pausing device requests for approximately {round(seconds)} seconds.")
+
+    def _auth_cooldown(self, method: str, path: str, response: requests.Response) -> DeviceCooldownError:
+        self._auth_failures += 1
+        base = self.config.hikvision_auth_cooldown_seconds
+        seconds = min(base * 2 ** min(self._auth_failures - 1, 16), max(base, MAX_AUTH_COOLDOWN_SECONDS))
+        detail = _describe_http_error(method, path, response)
+        return self._enter_cooldown(
+            DeviceAuthenticationError, seconds,
+            f"Hikvision authentication failed ({detail}); check the configured Hikvision username/password. "
+            f"Pausing device requests for approximately {round(seconds)} seconds.")
+
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         with self._lock:
+            after_cooldown = self._check_cooldown()
             response = self._send(method, path, **kwargs)
             if response.status_code == 401:
+                failure = parse_auth_failure(getattr(response, "content", b""))
                 # requests already answered the Digest challenge once; a final 401 usually means the cached
-                # nonce went stale between polls. Retry exactly once with fresh auth state.
-                LOG.warning("Hikvision %s %s returned HTTP 401 after authentication negotiation; "
-                            "recreating the session and retrying once.", method, path)
-                response.close()
-                self.reset_session()
-                response = self._send(method, path, **kwargs)
-                if response.status_code < 400:
-                    LOG.info("Hikvision %s %s succeeded after authentication session reset.", method, path)
+                # nonce went stale between polls. Retry exactly once with fresh auth state, but never while the
+                # account is locked, when the session is already fresh after a cooldown, or when the device
+                # says one more failed login would lock it.
+                if not failure.locked and not after_cooldown and (failure.retries_left is None
+                                                                  or failure.retries_left > 1):
+                    LOG.warning("Hikvision %s %s returned HTTP 401 after authentication negotiation; "
+                                "recreating the session and retrying once.", method, path)
+                    response.close()
+                    self.reset_session()
+                    response = self._send(method, path, **kwargs)
+                    if response.status_code == 401:
+                        failure = parse_auth_failure(getattr(response, "content", b""))
+                    elif response.status_code < 400:
+                        LOG.info("Hikvision %s %s succeeded after authentication session reset.", method, path)
+                if response.status_code == 401:
+                    error = self._lock_cooldown(failure) if failure.locked else self._auth_cooldown(method, path, response)
+                    response.close()
+                    raise error
+            if response.status_code < 400:
+                if after_cooldown:
+                    LOG.info("Hikvision authentication succeeded after the cooldown.")
+                self._auth_failures = 0
             return self._check(method, path, response)
 
     def _send(self, method: str, path: str, **kwargs: Any) -> requests.Response:
@@ -209,10 +385,10 @@ class HikvisionClient:
                      "major": int(self.config.event_major), "minor": int(self.config.event_minor)}
         # Serialised here so the logged body is byte-for-byte what the device receives.
         body = json.dumps({"AcsEventCond": condition})
-        LOG.info("Hikvision event discovery: searchID=%s searchResultPosition=%s maxResults=%s major=%s minor=%s",
+        LOG.debug("Hikvision event discovery: searchID=%s searchResultPosition=%s maxResults=%s major=%s minor=%s",
                  condition["searchID"], condition["searchResultPosition"], condition["maxResults"],
                  condition["major"], condition["minor"])
-        LOG.info("Hikvision AcsEventCond request body: %s", body)
+        LOG.debug("Hikvision AcsEventCond request body: %s", body)
         response = self._request("POST", ACS_EVENT_PATH, data=body.encode("utf-8"),
                                  headers={"Accept": "application/json", "Content-Type": "application/json"})
         try:

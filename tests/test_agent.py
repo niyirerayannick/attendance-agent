@@ -325,12 +325,17 @@ class InitialSyncTests(unittest.TestCase):
 
 
 class ScriptedStop(threading.Event):
-    """Replaces agent.stop_requested: records every wait instead of sleeping, stops after N cycles."""
+    """Replaces agent.stop_requested: records every wait instead of sleeping, stops after N cycles.
+
+    It also owns a fake monotonic clock that each wait advances, so scheduling is exact and instant.
+    """
     def __init__(self, cycles):
         super().__init__()
-        self.cycles, self.waits = cycles, []
+        self.cycles, self.waits, self.now = cycles, [], 1000.0
+    def clock(self): return self.now
     def wait(self, timeout=None):
         self.waits.append(timeout)
+        self.now += timeout or 0
         if len(self.waits) >= self.cycles:
             self.set()
         return self.is_set()
@@ -394,6 +399,7 @@ class RunLoopTests(unittest.TestCase):
         settings = {"poll_interval_seconds": 5} | overrides
         agent = AttendanceAgent(replace(config(self.db_path), **settings), self.store, device, cloud or FakeCloud())
         agent.stop_requested = ScriptedStop(cycles)
+        agent.clock = agent.stop_requested.clock
         agent.run()  # must return normally, never raise
         self.store = AgentStore(self.db_path)  # run() closes the store on exit
         return agent

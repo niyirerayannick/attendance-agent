@@ -1,22 +1,31 @@
 [Unit]
-Description=EPCA ONE Hikvision attendance agent
+Description=EPCA Hikvision Attendance Agent
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=epca-attendance
-Group=epca-attendance
-WorkingDirectory=/opt/epca-attendance-agent
-EnvironmentFile=/etc/epca-attendance-agent/environment
-ExecStart=/opt/epca-attendance-agent/venv/bin/python agent.py run
-Restart=on-failure
-RestartSec=20
+User=epca
+Group=epca
+WorkingDirectory=/home/epca/attendance-agent
+# Foreground process; systemd supervises it. Secrets are NOT set here: agent.py loads
+# /home/epca/attendance-agent/.env (chmod 600, owned by epca). It must contain
+# AGENT_DATA_DIR=/var/lib/epca-attendance-agent.
+ExecStart=/home/epca/attendance-agent/.venv/bin/python /home/epca/attendance-agent/agent.py run
+Restart=always
+RestartSec=10
+# SIGTERM ends the poll wait at once; the agent finishes the in-flight request (at most the
+# device/cloud timeout, 15-20 s) and SQLite transaction, closes sessions and the database, and exits 0.
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+# Creates /var/lib/epca-attendance-agent owned by epca (mode 0750) before start; never deletes it.
+StateDirectory=epca-attendance-agent
+StateDirectoryMode=0750
+SyslogIdentifier=epca-attendance-agent
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/epca-attendance-agent
+ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target

@@ -362,7 +362,8 @@ class AcsEventTests(unittest.TestCase):
             self.assertIn("invalid AcsEvent", str(ctx.exception))
 
     def test_event_requests_are_logged_without_credentials(self):
-        with self.assertLogs("epca_attendance_agent.hikvision", level="INFO") as logs:
+        # Per-poll request details are DEBUG so a 24/7 service does not log every few seconds.
+        with self.assertLogs("epca_attendance_agent.hikvision", level="DEBUG") as logs:
             HikvisionClient(config(), SequenceSession([Response(payload=ACS_EVENT_RESPONSE)])).search_events_page(20)
         output = "\n".join(logs.output)
         self.assertIn("Hikvision event discovery: searchID=1 searchResultPosition=20 maxResults=10 major=5 minor=38",

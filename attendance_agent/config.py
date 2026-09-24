@@ -21,6 +21,9 @@ class ConfigurationError(ValueError):
 
 
 MAX_POLL_INTERVAL_SECONDS = 86_400
+# The DS-K1T8003MF (V1.3.37) locks its account after repeated authentication failures; polling faster
+# than this is only recommended after a soak test proves it stable. The agent warns but never overrides.
+RECOMMENDED_MIN_POLL_INTERVAL_SECONDS = 15
 
 
 def load_project_env(env_file: str | os.PathLike[str] | None = None) -> bool:
@@ -120,6 +123,12 @@ class AgentConfig:
     # Failure backoff is independent of the polling interval: 5s, 10s, 20s ... capped at retry_max_seconds.
     retry_initial_seconds: int = 5
     retry_max_seconds: int = 300
+    # Hikvision lockout protection: while locked, no request is sent until the device-reported unlockTime
+    # (or the default below when it is missing/implausible) plus the margin has passed.
+    hikvision_lock_default_seconds: int = 1800
+    hikvision_lock_margin_seconds: int = 30
+    # After a 401 survives the one fresh-session retry: 300s, doubling per repeat, capped at one hour.
+    hikvision_auth_cooldown_seconds: int = 300
 
     def __post_init__(self) -> None:
         if not 1 <= self.poll_interval_seconds <= MAX_POLL_INTERVAL_SECONDS:
@@ -164,4 +173,7 @@ class AgentConfig:
             initial_sync_full_history=_boolean("INITIAL_SYNC_FULL_HISTORY", False),
             retry_initial_seconds=_positive_int("RETRY_INITIAL_SECONDS", 5),
             retry_max_seconds=_positive_int("RETRY_MAX_SECONDS", 300),
+            hikvision_lock_default_seconds=_positive_int("HIKVISION_LOCK_DEFAULT_SECONDS", 1800),
+            hikvision_lock_margin_seconds=_non_negative_int("HIKVISION_LOCK_MARGIN_SECONDS", 30),
+            hikvision_auth_cooldown_seconds=_positive_int("HIKVISION_AUTH_COOLDOWN_SECONDS", 300),
         )

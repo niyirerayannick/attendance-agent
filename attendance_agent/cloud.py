@@ -25,6 +25,12 @@ class EpcClient:
         self.config = config
         self.session = session or requests.Session()
 
+    def close(self) -> None:
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
     def _post(self, payload: dict[str, Any]) -> requests.Response:
         try:
             return self.session.post(self.config.epca_api_url, json=payload, verify=True,

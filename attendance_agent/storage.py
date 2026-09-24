@@ -13,20 +13,44 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+class StorageError(RuntimeError):
+    """The durable queue cannot be opened; raised at startup with an actionable message."""
+
+
 class AgentStore:
     def __init__(self, path: str):
-        Path(path).parent.mkdir(parents=True, exist_ok=True) if Path(path).parent != Path(".") else None
-        self.connection = sqlite3.connect(path)
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA foreign_keys=ON")
-        self._create_schema()
+        self.path = path
+        parent = Path(path).parent
+        try:
+            if parent != Path("."):
+                parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise StorageError(
+                f"Agent data directory {parent} does not exist and could not be created ({exc.__class__.__name__}). "
+                f"Create it for the service user, e.g. `sudo install -d -o epca -g epca {parent}`, "
+                "or set AGENT_DATA_DIR to a writable persistent directory.") from exc
+        try:
+            # Opens the existing database; tables are only created when missing, nothing is ever reset.
+            self.connection = sqlite3.connect(path)
+            self.connection.row_factory = sqlite3.Row
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            # FULL: a committed queue insert or delivery mark survives a power loss, not only a process crash.
+            self.connection.execute("PRAGMA synchronous=FULL")
+            self.connection.execute("PRAGMA foreign_keys=ON")
+            self._create_schema()
+        except sqlite3.Error as exc:
+            raise StorageError(f"Cannot open agent database {path}: {exc}. Check that AGENT_DATA_DIR is writable "
+                               "by the service user.") from exc
         self._closed = False
 
     def close(self) -> None:
+        """Commit anything outstanding and close; WAL content is checkpointed by SQLite on the last close."""
         if not self._closed:
-            self.connection.close()
-            self._closed = True
+            try:
+                self.connection.commit()
+            finally:
+                self.connection.close()
+                self._closed = True
 
     def _create_schema(self) -> None:
         self.connection.executescript("""

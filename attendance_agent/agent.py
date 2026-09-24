@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import signal
 import sys
@@ -13,21 +14,23 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+from urllib.parse import urlparse
 
 if __package__ in {None, ""}:  # supports the documented `python agent.py ...` command
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 try:  # Package imports work inside EPCA ONE until this directory is extracted.
     from attendance_agent.cloud import CloudAuthenticationError, CloudError, EpcClient
-    from attendance_agent.config import AgentConfig, ConfigurationError, load_project_env
-    from attendance_agent.hikvision import DeviceError, HikvisionClient
-    from attendance_agent.storage import AgentStore
+    from attendance_agent.config import (RECOMMENDED_MIN_POLL_INTERVAL_SECONDS, AgentConfig, ConfigurationError,
+                                         load_project_env)
+    from attendance_agent.hikvision import MAX_LOCK_SECONDS, DeviceCooldownError, DeviceError, HikvisionClient
+    from attendance_agent.storage import AgentStore, StorageError
 except ModuleNotFoundError:  # Standalone repository: modules live beside agent.py.
     from cloud import CloudAuthenticationError, CloudError, EpcClient
-    from config import AgentConfig, ConfigurationError, load_project_env
-    from hikvision import DeviceError, HikvisionClient
-    from storage import AgentStore
+    from config import RECOMMENDED_MIN_POLL_INTERVAL_SECONDS, AgentConfig, ConfigurationError, load_project_env
+    from hikvision import MAX_LOCK_SECONDS, DeviceCooldownError, DeviceError, HikvisionClient
+    from storage import AgentStore, StorageError
 
 
 LOG = logging.getLogger("epca_attendance_agent")
@@ -39,6 +42,10 @@ APP_DIR = Path(__file__).resolve().parent
 BOOTSTRAP_STATE_KEY = "event_bootstrap_complete"
 BACKFILL_POSITION_KEY = "event_backfill_position"
 BACKFILL_HIGH_SERIAL_KEY = "event_backfill_high_serial"
+# "<unix time> <lock|auth>": a Hikvision cooldown that must outlive a process/systemd restart.
+DEVICE_COOLDOWN_STATE_KEY = "hikvision_cooldown_until"
+# While nothing happens, the run loop logs one INFO status line per interval instead of one per poll.
+HEARTBEAT_SECONDS = 3600
 
 
 @dataclass
@@ -88,12 +95,36 @@ class AttendanceAgent:
         self.device = device or HikvisionClient(config)
         self.cloud = cloud or EpcClient(config)
         self.stop_requested = threading.Event()
+        self.clock: Callable[[], float] = time.monotonic  # scheduling only; replaced by a fake clock in tests
+        if hasattr(self.device, "on_cooldown"):
+            self.device.on_cooldown = self._remember_device_cooldown
+        self._restore_device_cooldown()
 
     def request_stop(self) -> None:
         """Stop after the current request/SQLite transaction completes."""
         if not self.stop_requested.is_set():
             LOG.info("Shutdown requested; finishing the current operation safely.")
             self.stop_requested.set()
+
+    def _remember_device_cooldown(self, seconds: float, kind: str) -> None:
+        """Persist a Hikvision cooldown so a restart (or a CLI check) does not authenticate while locked."""
+        self.store.set_state(DEVICE_COOLDOWN_STATE_KEY, f"{time.time() + seconds:.0f} {kind}")
+
+    def _restore_device_cooldown(self) -> None:
+        value = self.store.get_state(DEVICE_COOLDOWN_STATE_KEY)
+        if not value or not hasattr(self.device, "pause"):
+            return
+        try:
+            until, kind = value.split()
+            remaining = float(until) - time.time()
+        except ValueError:
+            return
+        # Bounded, so a wall-clock jump can never pause the device longer than any real lockout.
+        remaining = min(remaining, MAX_LOCK_SECONDS + self.config.hikvision_lock_margin_seconds)
+        if remaining > 0:
+            self.device.pause(remaining, kind)
+            LOG.warning("Hikvision requests remain paused for approximately %s seconds (%s recorded before restart).",
+                        round(remaining), "account lock" if kind == "lock" else "authentication failure")
 
     def test_device(self) -> dict[str, Any]:
         info = self.device.device_info()
@@ -218,7 +249,8 @@ class AttendanceAgent:
 
     def upload_pending(self) -> dict[str, int]:
         delivered = rejected = retried = 0
-        while True:
+        error = ""
+        while not self.stop_requested.is_set():
             batch = self.store.pending_events(self.config.batch_size)
             if not batch:
                 break
@@ -230,8 +262,9 @@ class AttendanceAgent:
                 self.store.set_state("last_cloud_error", "Cloud authentication failed")
                 raise
             except CloudError as exc:
-                self.store.mark_retry(serials, str(exc))
-                self.store.set_state("last_cloud_error", str(exc))
+                error = str(exc)
+                self.store.mark_retry(serials, error)
+                self.store.set_state("last_cloud_error", error)
                 retried += len(batch)
                 break
             bad_indexes = {item.get("index") for item in response.get("error_details", []) if isinstance(item, dict)}
@@ -245,7 +278,7 @@ class AttendanceAgent:
                     self.store.mark_delivered([event["serial_no"]])
                     delivered += 1
             self.store.set_state("last_cloud_error", "")
-        return {"delivered": delivered, "rejected": rejected, "retried": retried}
+        return {"delivered": delivered, "rejected": rejected, "retried": retried, "error": error}
 
     def sync_once(self) -> dict[str, Any]:
         result = {"discovery": self.poll_device(), "delivery": self.upload_pending()}
@@ -274,35 +307,129 @@ class AttendanceAgent:
         """Bounded exponential backoff for consecutive failures: 5, 10, 20 ... RETRY_MAX_SECONDS."""
         return min(self.config.retry_initial_seconds * (2 ** min(failures - 1, 16)), self.config.retry_max_seconds)
 
-    def run(self) -> None:
-        failures = 0
+    def _log_startup(self) -> None:
+        cfg = self.config
+        LOG.info("Attendance agent started: device_code=%s hikvision_host=%s poll_interval=%ss database=%s "
+                 "cloud_host=%s", cfg.epca_device_code, cfg.hikvision_host, cfg.poll_interval_seconds,
+                 cfg.database_path, urlparse(cfg.epca_api_url).hostname)
+        if cfg.poll_interval_seconds < RECOMMENDED_MIN_POLL_INTERVAL_SECONDS:
+            LOG.warning("POLL_INTERVAL_SECONDS=%s is below the recommended %s-30 seconds for the DS-K1T8003MF; "
+                        "keep it only if soak testing proved it stable.", cfg.poll_interval_seconds,
+                        RECOMMENDED_MIN_POLL_INTERVAL_SECONDS)
+        pending = self.store.queue_counts()["pending"]
+        if pending:
+            LOG.info("%s queued event(s) from a previous run are pending delivery.", pending)
+
+    def _heartbeat(self) -> None:
+        counts = self.store.queue_counts()
+        LOG.info("Agent running: pending=%s delivered=%s rejected=%s last_discovered_serial=%s",
+                 counts["pending"], counts["delivered"], counts["rejected"], self.store.discovery_cursor)
+
+    def _device_phase(self, failures: int) -> tuple[int, float]:
+        """Poll the terminal once; returns (consecutive failures, seconds until the next poll)."""
         try:
+            discovery = self.poll_device()
+        except DeviceCooldownError as exc:  # the client has already logged the lock/auth pause
+            return failures + 1, max(1, math.ceil(exc.retry_after))
+        except DeviceError as exc:
+            failures += 1
+            delay = self.failure_backoff(failures)
+            LOG.warning("Hikvision unavailable (%s); retry %s in %s seconds.", exc, failures, delay)
+            return failures, delay
+        except Exception as exc:  # a 24/7 service must outlive unexpected errors too
+            failures += 1
+            delay = self.failure_backoff(failures)
+            LOG.error("Unexpected device polling error (%s); retry %s in %s seconds.",
+                      exc.__class__.__name__, failures, delay)
+            LOG.debug("Unexpected device polling error detail.", exc_info=True)
+            return failures, delay
+        if failures:
+            LOG.info("Hikvision connection recovered after %s failed attempt(s); polling every %s seconds again.",
+                     failures, self.config.poll_interval_seconds)
+        if discovery["queued"]:
+            LOG.info("Discovered %s new attendance event(s).", discovery["queued"])
+        return 0, self.config.poll_interval_seconds
+
+    def _cloud_phase(self, failures: int) -> tuple[int, float]:
+        """Deliver the queue; returns (consecutive failures, seconds before delivery may be attempted again)."""
+        try:
+            delivery = self.upload_pending()
+        except CloudAuthenticationError:
+            delay = max(3600, self.config.poll_interval_seconds)
+            LOG.error("EPCA ONE rejected the device credentials; queued events are kept. Retrying in %s seconds.",
+                      delay)
+            return failures + 1, delay
+        except Exception as exc:
+            failures += 1
+            delay = self.failure_backoff(failures)
+            LOG.error("Unexpected cloud delivery error (%s); retry %s in %s seconds.",
+                      exc.__class__.__name__, failures, delay)
+            LOG.debug("Unexpected cloud delivery error detail.", exc_info=True)
+            return failures, delay
+        sent = delivery["delivered"] + delivery["rejected"]
+        if failures and sent:
+            LOG.info("Cloud connection recovered after %s failed attempt(s).", failures)
+        if sent:
+            LOG.info("Delivered %s queued event(s) to EPCA ONE (%s rejected).", delivery["delivered"],
+                     delivery["rejected"])
+        if delivery["retried"]:
+            failures = 0 if sent else failures
+            failures += 1
+            delay = self.failure_backoff(failures)
+            LOG.warning("EPCA ONE unavailable (%s); %s event(s) kept in the queue; retry %s in %s seconds.",
+                        delivery["error"], delivery["retried"], failures, delay)
+            return failures, delay
+        return 0, 0
+
+    def run(self) -> None:
+        """Foreground loop for systemd: device polling and cloud delivery recover independently, forever.
+
+        Device and cloud each keep their own schedule, so a locked or offline terminal never blocks delivery of
+        queued events and an Internet outage never slows device polling. Only request_stop() ends the loop.
+        """
+        device_failures = cloud_failures = 0
+        try:
+            self._log_startup()
+            now = self.clock()
+            device_due = cloud_due = now
+            next_heartbeat = now + HEARTBEAT_SECONDS
             while not self.stop_requested.is_set():
-                try:
-                    self.sync_once()
-                    if failures:
-                        LOG.info("Sync recovered after %s failed attempt(s); polling every %s seconds again.",
-                                 failures, self.config.poll_interval_seconds)
-                    failures = 0
-                    delay = self.config.poll_interval_seconds
-                except CloudAuthenticationError:
-                    failures += 1
-                    delay = max(3600, self.config.poll_interval_seconds)
-                    LOG.error("Cloud authentication failed; retrying in %s seconds.", delay)
-                except (CloudError, DeviceError) as exc:
-                    failures += 1
-                    delay = self.failure_backoff(failures)
-                    LOG.warning("Sync failed (%s); retry %s in %s seconds.", exc, failures, delay)
-                except Exception as exc:  # a 24/7 service must outlive unexpected errors too
-                    failures += 1
-                    delay = self.failure_backoff(failures)
-                    LOG.error("Unexpected sync error (%s); retry %s in %s seconds.",
-                              exc.__class__.__name__, failures, delay)
-                    LOG.debug("Unexpected sync error detail.", exc_info=True)
-                self.stop_requested.wait(delay)
+                now = self.clock()
+                if now >= device_due:
+                    device_failures, delay = self._device_phase(device_failures)
+                    device_due = now + delay
+                if self.stop_requested.is_set():
+                    break
+                if now >= cloud_due:  # a healthy cloud is served right after every device poll
+                    cloud_failures, delay = self._cloud_phase(cloud_failures)
+                    cloud_due = now + delay
+                if now >= next_heartbeat:
+                    next_heartbeat = now + HEARTBEAT_SECONDS
+                    try:
+                        self._heartbeat()
+                    except Exception:
+                        LOG.debug("Heartbeat failed.", exc_info=True)
+                # Only a failed delivery needs its own wake-up (the device may be paused for a long lockout).
+                wake = min(device_due, cloud_due) if cloud_failures else device_due
+                self.stop_requested.wait(max(0.0, wake - now))
         finally:
+            for resource in (self.device, self.cloud):
+                close = getattr(resource, "close", None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        LOG.debug("Closing %s failed.", resource.__class__.__name__, exc_info=True)
             self.store.close()
             LOG.info("Attendance agent stopped safely.")
+
+
+def install_signal_handlers(agent: AttendanceAgent) -> None:
+    """SIGTERM (systemd stop) and SIGINT (Ctrl+C) end the run loop after the current request/transaction."""
+    def handle_shutdown(signum, frame):
+        agent.request_stop()
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
 
 
 def main() -> int:
@@ -313,6 +440,10 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         load_project_env(APP_DIR / ".env")  # real environment variables take precedence
+        level = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+        if level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+            raise ConfigurationError("LOG_LEVEL must be DEBUG, INFO, WARNING or ERROR.")
+        logging.getLogger().setLevel(level)
         agent = AttendanceAgent(AgentConfig.from_environment(app_dir=APP_DIR))
         if args.command == "test-device":
             print(agent.test_device())
@@ -329,13 +460,10 @@ def main() -> int:
             result["users"] = [{k: v for k, v in user.items() if k != "raw"} for user in result["users"]]
             print(result)
         else:
-            def handle_shutdown(signum, frame):
-                agent.request_stop()
-            signal.signal(signal.SIGTERM, handle_shutdown)
-            signal.signal(signal.SIGINT, handle_shutdown)
+            install_signal_handlers(agent)
             agent.run()
         return 0
-    except (ConfigurationError, DeviceError, CloudError) as exc:
+    except (ConfigurationError, StorageError, DeviceError, CloudError) as exc:
         LOG.error("%s", exc)
         return 2
 
