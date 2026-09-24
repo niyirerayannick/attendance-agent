@@ -217,7 +217,7 @@ class HikvisionClient:
                  session_factory: Callable[[], requests.Session] | None = None,
                  clock: Callable[[], float] = time.monotonic):
         self.config = config
-        # An injected session (tests) is reused on recovery unless a factory is also supplied.
+        # An injected session (tests) is reused for every request unless a factory is also supplied.
         self._session_factory = session_factory or ((lambda: session) if session is not None else requests.Session)
         # One lock serialises requests and session replacement, so a swap never races an in-flight request.
         self._lock = threading.RLock()
@@ -225,35 +225,36 @@ class HikvisionClient:
         # While clock() < _cooldown_until no request of any kind is sent to the device.
         self._cooldown_until = 0.0
         self._cooldown_kind = ""
-        self._fresh_session_due = False  # the first request after a cooldown uses a brand-new session
+        self._cooldown_ended = False  # set when a cooldown starts; logged on the first request after it
         self._auth_failures = 0
         # Optional hook(seconds, kind) so the agent can persist a cooldown across restarts.
         self.on_cooldown: Callable[[float, str], None] | None = None
-        self.session = self._new_session()
+        # Created per request by reset_session(); see _request for why sessions are never reused.
+        self.session: requests.Session | None = None
 
     def _new_session(self) -> requests.Session:
-        """A Session whose HTTPDigestAuth holds the nonce/nc state reused across requests."""
         session = self._session_factory()
         session.auth = HTTPDigestAuth(self.config.hikvision_username, self.config.hikvision_password)
         return session
 
     def reset_session(self) -> None:
-        """Drop cached Digest nonce state and pooled connections, then start a fresh session."""
+        """Close the previous session (pooled connection and Digest nonce state), then start a fresh one."""
         with self._lock:
             old = self.session
-            self.session = self._new_session()
-            if old is not self.session:
+            if old is not None:
                 try:
                     old.close()
-                except Exception:  # closing a dead pool must never break recovery
+                except Exception:  # closing a dead pool must never break the next request
                     pass
+            self.session = self._new_session()
 
     def close(self) -> None:
         with self._lock:
-            try:
-                self.session.close()
-            except Exception:
-                pass
+            if self.session is not None:
+                try:
+                    self.session.close()
+                except Exception:
+                    pass
 
     def cooldown_remaining(self) -> float:
         return max(0.0, self._cooldown_until - self._clock())
@@ -266,7 +267,7 @@ class HikvisionClient:
     def _start_cooldown(self, seconds: float, kind: str) -> None:
         self._cooldown_until = max(self._cooldown_until, self._clock() + seconds)
         self._cooldown_kind = kind
-        self._fresh_session_due = True
+        self._cooldown_ended = True
 
     def _check_cooldown(self) -> bool:
         """Raise while paused; return True when this is the first request after a cooldown ended."""
@@ -277,11 +278,10 @@ class HikvisionClient:
             LOG.debug("Hikvision request skipped: %s for approximately %s more seconds.", reason, round(remaining))
             raise error(f"Hikvision requests paused ({reason}) for approximately {round(remaining)} more seconds.",
                         remaining)
-        if not self._fresh_session_due:
+        if not self._cooldown_ended:
             return False
-        self._fresh_session_due = False
+        self._cooldown_ended = False
         LOG.info("Hikvision cooldown finished; trying one request with a fresh authentication session.")
-        self.reset_session()
         return True
 
     def _enter_cooldown(self, error: type[DeviceCooldownError], seconds: float, message: str) -> DeviceCooldownError:
@@ -314,28 +314,19 @@ class HikvisionClient:
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         with self._lock:
             after_cooldown = self._check_cooldown()
+            # DS-K1T8003MF V1.3.37 rejects a Digest nonce reused from an earlier poll (every reuse ended in
+            # 401), so every request starts a fresh Session + HTTPDigestAuth. requests then performs the
+            # normal negotiation internally: unauthenticated challenge (401) -> Digest request -> response.
+            # That internal challenge is never seen here and is not an authentication failure.
+            self.reset_session()
             response = self._send(method, path, **kwargs)
             if response.status_code == 401:
+                # A final 401 after a clean negotiation with fresh state is a genuine failure: no retry
+                # (another attempt would only spend a login), straight to lockout/cooldown protection.
                 failure = parse_auth_failure(getattr(response, "content", b""))
-                # requests already answered the Digest challenge once; a final 401 usually means the cached
-                # nonce went stale between polls. Retry exactly once with fresh auth state, but never while the
-                # account is locked, when the session is already fresh after a cooldown, or when the device
-                # says one more failed login would lock it.
-                if not failure.locked and not after_cooldown and (failure.retries_left is None
-                                                                  or failure.retries_left > 1):
-                    LOG.warning("Hikvision %s %s returned HTTP 401 after authentication negotiation; "
-                                "recreating the session and retrying once.", method, path)
-                    response.close()
-                    self.reset_session()
-                    response = self._send(method, path, **kwargs)
-                    if response.status_code == 401:
-                        failure = parse_auth_failure(getattr(response, "content", b""))
-                    elif response.status_code < 400:
-                        LOG.info("Hikvision %s %s succeeded after authentication session reset.", method, path)
-                if response.status_code == 401:
-                    error = self._lock_cooldown(failure) if failure.locked else self._auth_cooldown(method, path, response)
-                    response.close()
-                    raise error
+                error = self._lock_cooldown(failure) if failure.locked else self._auth_cooldown(method, path, response)
+                response.close()
+                raise error
             if response.status_code < 400:
                 if after_cooldown:
                     LOG.info("Hikvision authentication succeeded after the cooldown.")

@@ -3,6 +3,7 @@
 Everything is mocked; no test talks to a real Hikvision terminal or EPCA ONE.
 """
 
+import io
 import json
 import logging
 import os
@@ -124,7 +125,7 @@ class DeviceSession:
 
 
 class DeviceSessions:
-    """session_factory: each new session takes the next script; the log is shared (the terminal itself)."""
+    """session_factory: each new session (= each device request) takes the next script; the log is shared."""
     def __init__(self, log, *scripts):
         self.log, self.scripts, self.sessions = log, list(scripts), []
     def __call__(self):
@@ -290,33 +291,35 @@ class LockoutClientTests(Base):
             client.search_events_page(0)
         self.assertEqual(ctx.exception.retry_after, 1800 + 30)
 
-    def test_lock_detected_on_fresh_session_retry(self):
+    def test_lock_after_a_genuine_401(self):
         factory = DeviceSessions([], [unauthorized()], [locked(300)])
+        client = self.device(factory)
+        self.assertRaises(DeviceAuthenticationError, client.search_events_page, 0)
+        self.clock.advance(300)
         with self.assertRaises(DeviceLockedError) as ctx:
-            self.device(factory).search_events_page(0)
+            client.search_events_page(0)
         self.assertEqual(ctx.exception.retry_after, 330)
         self.assertEqual(factory.requests, 2)
 
-    def test_ordinary_401_has_one_recovery_then_escalating_cooldown(self):
-        factory = DeviceSessions([], [unauthorized(UNLOCKED_401_XML)], [unauthorized()], [unauthorized()],
-                                 [unauthorized()], [])
+    def test_genuine_401_has_no_retry_and_escalating_cooldown(self):
+        factory = DeviceSessions([], [unauthorized(UNLOCKED_401_XML)], [unauthorized()], [unauthorized()], [])
         client = self.device(factory)
         with self.assertRaises(DeviceAuthenticationError) as ctx:
             client.search_events_page(0)
         self.assertIn("HTTP 401", str(ctx.exception))
         self.assertEqual(ctx.exception.retry_after, 300)
-        self.assertEqual(factory.requests, 2)  # original + one fresh-session recovery
+        self.assertEqual(factory.requests, 1)  # a final 401 on a fresh session is never retried
         self.clock.advance(299)
         self.assertRaises(DeviceAuthenticationError, client.search_events_page, 0)
-        self.assertEqual(factory.requests, 2)
+        self.assertEqual(factory.requests, 1)
         self.clock.advance(1)
         with self.assertRaises(DeviceAuthenticationError) as ctx:
-            client.search_events_page(0)  # after a cooldown the session is already fresh: no second retry
-        self.assertEqual((ctx.exception.retry_after, factory.requests), (600, 3))
+            client.search_events_page(0)
+        self.assertEqual((ctx.exception.retry_after, factory.requests), (600, 2))
         self.clock.advance(600)
         with self.assertRaises(DeviceAuthenticationError) as ctx:
             client.search_events_page(0)
-        self.assertEqual((ctx.exception.retry_after, factory.requests), (1200, 4))
+        self.assertEqual((ctx.exception.retry_after, factory.requests), (1200, 3))
         self.clock.advance(1200)
         client.search_events_page(0)  # success resets the escalation
         self.assertEqual(client._auth_failures, 0)
@@ -334,14 +337,14 @@ class LockoutClientTests(Base):
             client.search_events_page(0)
         self.assertNotIsInstance(ctx.exception, DeviceLockedError)
         client.search_events_page(0)  # the device is retried as soon as the caller wants
-        self.assertEqual(len(factory.sessions), 1)
+        self.assertEqual(len(factory.sessions), 2)
 
     def test_credentials_never_logged(self):
         factory = DeviceSessions([], [unauthorized(UNLOCKED_401_XML)], [unauthorized()], [locked(60)], [])
         client = self.device(factory)
         errors = []
         with self.assertLogs("epca_attendance_agent", level="DEBUG") as logs:
-            for advance in (0, 300, 90):
+            for advance in (0, 300, 600, 90):
                 self.clock.advance(advance)
                 try:
                     client.search_events_page(0)
@@ -443,11 +446,11 @@ class OutageTests(Base):
         store = AgentStore(self.db_path)
         store.commit_discovery([], cursor=4)
         log = [raw_event(n) for n in range(1, 7)]
-        factory = DeviceSessions(log, [requests.ConnectionError("No route to host"),
-                                       requests.ConnectTimeout("timed out"),
-                                       requests.ConnectionError("Connection refused"),  # rebooting
-                                       requests.ReadTimeout("read timed out"),
-                                       Response(503, content=b"")])
+        factory = DeviceSessions(log, [requests.ConnectionError("No route to host")],
+                                 [requests.ConnectTimeout("timed out")],
+                                 [requests.ConnectionError("Connection refused")],  # rebooting
+                                 [requests.ReadTimeout("read timed out")],
+                                 [Response(503, content=b"")])
         with self.assertLogs("epca_attendance_agent", level="INFO") as logs:
             waits = self.run_cycles(self.agent(self.device(factory), store=store), 7)
         self.assertEqual(waits, [5, 10, 20, 40, 80, 15, 15])
@@ -461,7 +464,7 @@ class OutageTests(Base):
     def test_device_offline_keeps_delivering_queued_events(self):
         store = AgentStore(self.db_path)
         store.commit_discovery([agent_module.event_from_isapi(raw_event(8))], cursor=8)
-        factory = DeviceSessions([], [requests.ConnectionError("offline")] * 10)
+        factory = DeviceSessions([], *[[requests.ConnectionError("offline")]] * 10)
         cloud = CloudSession()
         self.run_cycles(self.agent(self.device(factory), cloud, store=store), 2)
         self.assertEqual(cloud.delivered, [8])
@@ -600,6 +603,137 @@ class ShutdownTests(Base):
         cloud.post = post_then_stop
         self.assertEqual(agent.upload_pending()["delivered"], 2)
         self.assertEqual(store.queue_counts(), {"pending": 3, "delivered": 2, "rejected": 0})
+        store.close()
+
+
+class DigestTerminal(requests.adapters.BaseAdapter):
+    """Transport-level model of the DS-K1T8003MF (V1.3.37) behind a REAL requests.Session + HTTPDigestAuth.
+
+    An unauthenticated request gets a Digest challenge with a new nonce. An authenticated request succeeds only
+    with a nonce this terminal issued, used for the first time (nc=00000001). A reused nonce gets the final 401
+    seen in production, which carries no new challenge. ``locked`` answers every authenticated request with the
+    userCheck lock body.
+    """
+    def __init__(self, log, locked_body=None, wrong_password=False):
+        super().__init__()
+        self.log, self.locked_body, self.wrong_password = log, locked_body, wrong_password
+        self.exchanges, self.issued, self.used, self.sessions = [], set(), set(), []
+
+    def session(self):
+        terminal = self
+        class TrackedSession(requests.Session):
+            closed = False
+            def close(self):
+                self.closed = True
+                super().close()
+        session = TrackedSession()
+        session.mount("http://", terminal)
+        self.sessions.append(session)
+        return session
+
+    def _reply(self, request, status, body=b"", headers=None):
+        response = requests.Response()
+        response.status_code, response._content, response.request = status, body, request
+        response.headers = requests.structures.CaseInsensitiveDict(headers or {})
+        response.url, response.connection, response.raw, response.encoding = request.url, self, io.BytesIO(body), "utf-8"
+        return response
+
+    def send(self, request, **kwargs):
+        authorization = request.headers.get("Authorization", "")
+        if not authorization.startswith("Digest "):
+            nonce = f"n{len(self.issued)}"
+            self.issued.add(nonce)
+            self.exchanges.append(("challenge", None))
+            return self._reply(request, 401, b"", {"WWW-Authenticate":
+                                                   f'Digest realm="DS-K1T8003MF", nonce="{nonce}", qop="auth"'})
+        fields = requests.utils.parse_dict_header(authorization[len("Digest "):])
+        nonce, nc = fields.get("nonce"), fields.get("nc")
+        self.exchanges.append(("digest", (nonce, nc)))
+        if self.locked_body is not None:
+            return self._reply(request, 401, self.locked_body, {"Content-Type": "application/xml"})
+        if self.wrong_password or nonce not in self.issued or nonce in self.used or nc != "00000001":
+            return self._reply(request, 401, UNLOCKED_401_XML, {"Content-Type": "application/xml"})
+        self.used.add(nonce)
+        body = json.loads(request.body)["AcsEventCond"]
+        page = self.log[body["searchResultPosition"]:body["searchResultPosition"] + body["maxResults"]]
+        payload = {"AcsEvent": {"searchID": "1", "numOfMatches": len(page), "totalMatches": len(self.log),
+                                "InfoList": page, "responseStatusStrg": "OK"}}
+        return self._reply(request, 200, json.dumps(payload).encode(), {"Content-Type": "application/json"})
+
+    def close(self):
+        pass
+
+
+class DigestNegotiationTests(Base):
+    def test_reused_digest_session_is_what_fails_on_this_firmware(self):
+        terminal = DigestTerminal([raw_event(1)])
+        session = terminal.session()
+        session.auth = HTTPDigestAuth(USERNAME, PASSWORD)
+        url = "http://192.168.88.187/ISAPI/AccessControl/AcsEvent?format=json"
+        body = json.dumps({"AcsEventCond": ACS_COND}).encode()
+        self.assertEqual(session.post(url, data=body).status_code, 200)
+        self.assertEqual(session.post(url, data=body).status_code, 401)  # reused nonce: the production symptom
+
+    def test_each_poll_negotiates_digest_freshly_and_succeeds(self):
+        terminal = DigestTerminal([raw_event(1), raw_event(2)])
+        client = self.device(terminal.session)
+        with self.assertLogs("epca_attendance_agent", level="DEBUG") as logs:
+            for _ in range(3):
+                self.assertEqual(client.search_events_page(0)["totalMatches"], 2)
+                self.clock.advance(30)
+        # Standard negotiation per request: challenge -> one Digest request (nc=1, new nonce) -> 200.
+        self.assertEqual(terminal.exchanges, [("challenge", None), ("digest", ("n0", "00000001")),
+                                              ("challenge", None), ("digest", ("n1", "00000001")),
+                                              ("challenge", None), ("digest", ("n2", "00000001"))])
+        self.assertEqual([s.closed for s in terminal.sessions], [True, True, False])
+        output = "\n".join(logs.output)
+        self.assertNotIn("401", output)  # the internal challenge is not an application-level failure
+        self.assertNotIn("authentication failed", output)
+        self.assertEqual(client._auth_failures, 0)
+
+    def test_genuine_final_401_after_negotiation_invokes_cooldown_once(self):
+        terminal = DigestTerminal([], wrong_password=True)
+        client = self.device(terminal.session)
+        with self.assertRaises(DeviceAuthenticationError):
+            client.search_events_page(0)
+        self.assertEqual([kind for kind, _ in terminal.exchanges], ["challenge", "digest"])  # one login, no retry
+        self.clock.advance(299)
+        self.assertRaises(DeviceAuthenticationError, client.search_events_page, 0)
+        self.assertEqual(len(terminal.exchanges), 2)
+
+    def test_lock_after_negotiation_prevents_all_further_requests(self):
+        terminal = DigestTerminal([], locked_body=LOCKED_XML.replace(b"1795", b"600"))
+        agent = self.agent(self.device(terminal.session))
+        with self.assertRaises(DeviceLockedError) as ctx:
+            agent.poll_device()
+        self.assertEqual(ctx.exception.retry_after, 630)
+        self.assertEqual([kind for kind, _ in terminal.exchanges], ["challenge", "digest"])
+        for step in (1, 300, 629):
+            self.clock.now = 1000.0 + step
+            self.assertRaises(DeviceLockedError, agent.poll_device)
+            self.assertRaises(DeviceLockedError, agent.test_device)
+        self.assertEqual(len(terminal.exchanges), 2)
+        self.assertTrue(agent.store.get_state(DEVICE_COOLDOWN_STATE_KEY).endswith(" lock"))  # persisted in SQLite
+        agent.store.close()
+
+    def test_run_loop_polls_every_30s_without_401s_duplicates_or_cursor_change(self):
+        log = [raw_event(n) for n in (7, 8)]
+        terminal = DigestTerminal(log)
+        cloud = CloudSession()
+        store = AgentStore(self.db_path)
+        store.commit_discovery([], cursor=6)
+        with self.assertLogs("epca_attendance_agent", level="INFO") as logs:
+            waits = self.run_cycles(self.agent(self.device(terminal.session), cloud, store=store,
+                                               poll_interval_seconds=30), 3)
+        self.assertEqual(waits, [30, 30, 30])
+        self.assertEqual(cloud.delivered, [7, 8])  # each event exactly once
+        self.assertEqual(len(terminal.sessions), 3)
+        self.assertTrue(all(s.closed for s in terminal.sessions))
+        self.assertEqual([kind for kind, _ in terminal.exchanges], ["challenge", "digest"] * 3)
+        self.assertNotIn("HTTP 401", "\n".join(logs.output))
+        store = self.reopen()
+        self.assertEqual(store.discovery_cursor, 8)
+        self.assertEqual(store.queue_counts(), {"pending": 0, "delivered": 2, "rejected": 0})
         store.close()
 
 

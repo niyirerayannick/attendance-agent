@@ -368,9 +368,10 @@ class FakeHttpSession:
     """Stands in for requests.Session: serves the event log over the proven AcsEvent contract."""
     instances = []
     def __init__(self, log, script):
-        self.log, self.script, self.auth, self.bodies = log, script, None, []
+        self.log, self.script, self.auth, self.bodies, self.requests, self.closed = log, script, None, [], 0, False
         FakeHttpSession.instances.append(self)
     def request(self, method, url, **kwargs):
+        self.requests += 1
         body = json.loads(kwargs["data"])["AcsEventCond"]
         self.bodies.append(body)
         if self.script:
@@ -382,7 +383,7 @@ class FakeHttpSession:
         return FakeHttpResponse(200, {"AcsEvent": {"searchID": "1", "numOfMatches": len(page),
                                                    "totalMatches": len(self.log), "InfoList": page,
                                                    "responseStatusStrg": "OK"}})
-    def close(self): pass
+    def close(self): self.closed = True
 
 
 class RunLoopTests(unittest.TestCase):
@@ -452,22 +453,25 @@ class RunLoopTests(unittest.TestCase):
         self.assertEqual(sent, [1, 2])  # each attendance event uploaded exactly once
         self.assertEqual(self.store.queue_counts(), {"pending": 0, "delivered": 2, "rejected": 0})
 
-    def test_single_401_recovered_by_fresh_session_uses_normal_interval(self):
+    def test_each_poll_uses_a_fresh_digest_session(self):
         FakeHttpSession.instances = []
         log = [raw(1), raw(2)]
-        scripts = iter([[200, 401], [200]])  # 2nd request of the 1st session is a stale-nonce 401
-        client = HikvisionClient(replace(config(self.db_path), poll_interval_seconds=5),
-                                 session_factory=lambda: FakeHttpSession(log, next(scripts)))
+        client = HikvisionClient(replace(config(self.db_path), poll_interval_seconds=30),
+                                 session_factory=lambda: FakeHttpSession(log, []))
         cloud = FakeCloud({"created": 2})
-        agent = self.run_agent(client, cycles=3, cloud=cloud)
-        self.assertEqual(agent.stop_requested.waits, [5, 5, 5])  # no failure backoff at all
-        self.assertEqual(len(FakeHttpSession.instances), 2)
+        agent = self.run_agent(client, cycles=3, cloud=cloud, poll_interval_seconds=30)
+        self.assertEqual(agent.stop_requested.waits, [30, 30, 30])  # no failure backoff at all
+        self.assertEqual(len(FakeHttpSession.instances), 3)  # one per poll (one probe request each)
+        self.assertEqual([s.requests for s in FakeHttpSession.instances], [1, 1, 1])
+        self.assertTrue(all(s.closed for s in FakeHttpSession.instances))  # replaced ones and the last at stop
+        self.assertEqual(len({id(s.auth) for s in FakeHttpSession.instances}), 3)
         for session in FakeHttpSession.instances:
             self.assertIsInstance(session.auth, HTTPDigestAuth)
-        self.assertEqual([e["serial_no"] for batch in cloud.sent for e in batch], [1, 2])
-        # the retried request is byte-for-byte the proven AcsEventCond
-        self.assertEqual(FakeHttpSession.instances[1].bodies[0],
-                         {"searchID": "1", "searchResultPosition": 0, "maxResults": 10, "major": 5, "minor": 38})
+            # every poll sends byte-for-byte the proven AcsEventCond
+            self.assertEqual(session.bodies[0],
+                             {"searchID": "1", "searchResultPosition": 0, "maxResults": 10, "major": 5, "minor": 38})
+        self.assertEqual([e["serial_no"] for batch in cloud.sent for e in batch], [1, 2])  # no duplicates
+        self.assertEqual(self.store.discovery_cursor, 2)
 
     def test_run_logs_contain_no_credentials(self):
         FakeHttpSession.instances = []

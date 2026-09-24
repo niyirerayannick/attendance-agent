@@ -122,8 +122,11 @@ kept, and the affected side retries on its own schedule:
 
 ### Hikvision lockout protection
 
-All Hikvision calls share one `requests.Session` with `HTTPDigestAuth`. On an HTTP 401 the agent parses
-the device's `<userCheck>`/`ResponseStatus` body (XML or JSON) for `lockStatus`, `unlockTime`,
+The DS-K1T8003MF (V1.3.37) rejects a Digest session reused from an earlier poll, so **every Hikvision
+request uses a new `requests.Session` and `HTTPDigestAuth`**. The previous session is closed first. Each
+request performs the standard negotiation: an unauthenticated challenge (HTTP 401), one Digest request,
+then the response. That internal challenge is not a failure. Only an HTTP 401 that is still the final
+response after negotiation counts as an authentication failure. The agent then parses the device's `<userCheck>`/`ResponseStatus` body (XML or JSON) for `lockStatus`, `unlockTime`,
 `retryLoginTime` and `statusString`:
 
 1. **`lockStatus=lock`:** no retry. The agent logs
@@ -132,10 +135,9 @@ the device's `<userCheck>`/`ResponseStatus` body (XML or JSON) for `lockStatus`,
    If `unlockTime` is missing or implausible (outside 1 s–24 h) it uses `HIKVISION_LOCK_DEFAULT_SECONDS`
    (default `1800`). When the pause ends it creates a new `requests.Session` and `HTTPDigestAuth` and
    sends one normal request. If the device is still locked, it reads the new `unlockTime` and waits again.
-2. **Ordinary 401 (not locked):** at most one fresh-session retry. This covers a stale nonce between polls
-   and is skipped when the device reports `retryLoginTime` ≤ 1. If that retry also fails, device
-   requests pause for `HIKVISION_AUTH_COOLDOWN_SECONDS` (default `300`), doubling on each repeat up to
-   one hour. After a pause, a single fresh-session request is made, with no extra retry.
+2. **Ordinary final 401 (not locked):** no retry, because the session was already fresh. Device requests
+   pause for `HIKVISION_AUTH_COOLDOWN_SECONDS` (default `300`), doubling on each repeat up to one hour.
+   After a pause, a single request is made.
 3. The pause is also written to SQLite, so a systemd restart or a manual `test-device` does not
    authenticate against a locked account.
 

@@ -7,11 +7,11 @@ from requests.auth import HTTPDigestAuth
 try:
     from attendance_agent.cloud import CloudAuthenticationError, EpcClient
     from attendance_agent.config import AgentConfig
-    from attendance_agent.hikvision import DeviceError, HikvisionClient
+    from attendance_agent.hikvision import DeviceAuthenticationError, DeviceError, HikvisionClient
 except ModuleNotFoundError:
     from cloud import CloudAuthenticationError, EpcClient
     from config import AgentConfig
-    from hikvision import DeviceError, HikvisionClient
+    from hikvision import DeviceAuthenticationError, DeviceError, HikvisionClient
 
 
 def config():
@@ -412,58 +412,52 @@ SECRETS = ("password-not-logged", "cloud-token-not-logged", "Authorization", "Di
 
 
 class DigestSessionTests(unittest.TestCase):
-    def test_digest_session_is_reused_across_requests(self):
-        factory = SessionFactory([Response(payload=EVENTS_OK)])
+    def test_every_request_uses_a_fresh_digest_session(self):
+        factory = SessionFactory([Response(payload=EVENTS_OK)], [Response(payload=EVENTS_OK)],
+                                 [Response(payload=EVENTS_OK)])
         client = HikvisionClient(config(), session_factory=factory)
         for _ in range(3):
             client.search_events_page(0)
-        self.assertEqual(len(factory.sessions), 1)
-        self.assertEqual(len(factory.sessions[0].calls), 3)
-        auth = factory.sessions[0].auth
-        self.assertIsInstance(auth, HTTPDigestAuth)
-        self.assertEqual((auth.username, auth.password), ("reader", "password-not-logged"))
+        self.assertEqual(len(factory.sessions), 3)  # DS-K1T8003MF rejects a Digest nonce reused across polls
+        self.assertEqual([len(s.calls) for s in factory.sessions], [1, 1, 1])
+        self.assertEqual([s.closed for s in factory.sessions], [True, True, False])  # previous one closed
+        auths = [s.auth for s in factory.sessions]
+        for auth in auths:
+            self.assertIsInstance(auth, HTTPDigestAuth)
+            self.assertEqual((auth.username, auth.password), ("reader", "password-not-logged"))
+        self.assertEqual(len({id(auth) for auth in auths}), 3)
+        client.close()
+        self.assertTrue(factory.sessions[-1].closed)
 
-    def test_final_401_recreates_session_and_retry_succeeds(self):
+    def test_final_401_is_a_genuine_failure_without_retry(self):
         factory = SessionFactory([Response(status=401)], [Response(payload=EVENTS_OK)])
         client = HikvisionClient(config(), session_factory=factory)
-        page = client.search_events_page(0)
-        self.assertEqual(page["totalMatches"], 0)
-        self.assertEqual(len(factory.sessions), 2)
-        old, new = factory.sessions
-        self.assertTrue(old.closed)
-        self.assertIs(client.session, new)
-        self.assertIsInstance(new.auth, HTTPDigestAuth)
-        # identical request body on the retry: event logic is untouched
-        self.assertEqual(old.calls[0][1]["data"], new.calls[0][1]["data"])
-
-    def test_repeated_401_retries_exactly_once_then_fails(self):
-        factory = SessionFactory([Response(status=401)], [Response(status=401)], [Response(payload=EVENTS_OK)])
-        client = HikvisionClient(config(), session_factory=factory)
-        with self.assertRaises(DeviceError) as ctx:
+        with self.assertRaises(DeviceAuthenticationError) as ctx:
             client.search_events_page(0)
         self.assertIn("HTTP 401", str(ctx.exception))
-        self.assertEqual(len(factory.sessions), 2)  # original + one fresh session, never a third
-        self.assertEqual(sum(len(s.calls) for s in factory.sessions), 2)
+        self.assertEqual(len(factory.sessions), 1)  # no extra session and no second login attempt
+        self.assertEqual(len(factory.sessions[0].calls), 1)
 
-    def test_401_recovery_logs_contain_no_credentials(self):
-        factory = SessionFactory([Response(status=401)], [Response(status=401)])
+    def test_401_logs_contain_no_credentials(self):
+        factory = SessionFactory([Response(status=401)])
         with self.assertLogs("epca_attendance_agent.hikvision", level="INFO") as logs:
             with self.assertRaises(DeviceError) as ctx:
                 HikvisionClient(config(), session_factory=factory).search_events_page(0)
         output = "\n".join(logs.output) + "\n" + str(ctx.exception)
-        self.assertIn("recreating the session and retrying once", output)
+        self.assertIn("Hikvision authentication failed", output)
         for secret in SECRETS:
             self.assertNotIn(secret, output)
 
-    def test_timeout_is_a_device_error_without_session_reset(self):
+    def test_timeout_is_a_device_error_not_a_cooldown(self):
         from requests import Timeout
-        factory = SessionFactory([Timeout("read timed out"), Response(payload=EVENTS_OK)])
+        factory = SessionFactory([Timeout("read timed out")], [Response(payload=EVENTS_OK)])
         client = HikvisionClient(config(), session_factory=factory)
         with self.assertRaises(DeviceError) as ctx:
             client.search_events_page(0)
+        self.assertNotIsInstance(ctx.exception, DeviceAuthenticationError)
         self.assertIn("Timeout", str(ctx.exception))
-        self.assertEqual(client.search_events_page(0)["totalMatches"], 0)  # next call recovers
-        self.assertEqual(len(factory.sessions), 1)
+        self.assertEqual(client.search_events_page(0)["totalMatches"], 0)  # next call recovers at once
+        self.assertEqual(len(factory.sessions), 2)
 
     def test_non_401_errors_are_not_retried(self):
         factory = SessionFactory([Response(status=400, content=b'{"statusCode": 6}')])
