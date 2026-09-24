@@ -252,6 +252,18 @@ volume and environment variables. To back up state, stop the application first a
 entire persistent volume (database plus WAL files), or use SQLite's online backup tooling; never
 copy only the main database while it is actively being written.
 
+### Historical backfill
+
+Historical imports are explicit and never change `last_discovered_serial` or the live delivery queue:
+
+```bash
+sudo systemctl stop epca-attendance-agent
+./.venv/bin/python agent.py backfill --from 2025-01-01 --to 2026-09-24
+sudo systemctl start epca-attendance-agent
+```
+
+Use `--all` only when the complete terminal history is intended. `--dry-run` scans and reports matching punches without sending anything or recording a checkpoint. A normal backfill stores a separate range-keyed page checkpoint in SQLite; rerun the exact same range after interruption. Pages are checkpointed only after EPCA acknowledges them, so replay is safe through EPCA's device-and-serial idempotency. Stop the service first to avoid concurrent terminal access; the command never controls systemd itself.
+
 ## Verification and tests
 
 All agent tests mock device and cloud HTTP behavior; they never need a terminal or an EPCA server:

@@ -12,7 +12,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
@@ -287,6 +287,71 @@ class AttendanceAgent:
                  result["delivery"]["delivered"], result["delivery"]["rejected"])
         return result
 
+    def backfill(self, range_from: date | None, range_to: date | None, *, all_history: bool = False,
+                 dry_run: bool = False) -> dict[str, Any]:
+        """Import a date-bounded AcsEvent history without touching live queue/cursor state.
+
+        Checkpoint advancement occurs only after a page was either inspected in dry-run mode or
+        acknowledged by EPCA.  Thus an interrupted cloud request is safely replayed by serial.
+        """
+        from_text = range_from.isoformat() if range_from else None
+        to_text = range_to.isoformat() if range_to else None
+        job_id = "all" if all_history else f"{from_text}:{to_text}"
+        job = self.store.backfill_job(job_id, from_text, to_text, all_history)
+        if job["completed_at"] and not dry_run:
+            return job | {"complete": True, "resumed": True}
+        totals = {key: int(job[key]) for key in ("scanned", "matched", "delivered", "already_existing", "unmapped", "rejected", "failed")}
+        position, oldest, newest = int(job["next_position"]), job["oldest_event_time"], job["newest_event_time"]
+        # A dry run intentionally has no durable checkpoint: it cannot later result in delivery.
+        if dry_run:
+            totals = {key: 0 for key in totals}; position = 0; oldest = newest = None
+        while not self.stop_requested.is_set():
+            page = self.device.search_events_page(position)
+            raw_events = page["events"]
+            selected: list[dict[str, Any]] = []
+            for raw in raw_events:
+                totals["scanned"] += 1
+                event = event_from_isapi(raw)
+                if event is None:
+                    continue
+                # The unmodified timestamp string defines the device-local calendar date.
+                try:
+                    event_day = date.fromisoformat(event["event_time"][:10])
+                except ValueError:
+                    continue
+                if not all_history and (event_day < range_from or event_day > range_to):
+                    continue
+                selected.append(event)
+                totals["matched"] += 1
+                oldest = min(filter(None, [oldest, event["event_time"]]), default=event["event_time"])
+                newest = max(filter(None, [newest, event["event_time"]]), default=event["event_time"])
+            if not dry_run and selected:
+                response = self.cloud.send_events(selected)
+                errors = {item.get("index") for item in response.get("error_details", []) if isinstance(item, dict)}
+                totals["rejected"] += len(errors)
+                acknowledged = len(selected) - len(errors)
+                duplicates = min(max(int(response.get("duplicates", 0) or 0), 0), acknowledged)
+                totals["already_existing"] += duplicates
+                totals["delivered"] += acknowledged - duplicates
+                # Only use this explicit server aggregate; never infer unmapped employees locally.
+                totals["unmapped"] += min(max(int(response.get("unmapped", 0) or 0), 0), acknowledged)
+            # Some firmware returns a short page before the final page; advance by what it
+            # actually returned so no historical records are skipped.
+            next_position = position + max(1, int(page.get("numOfMatches") or len(raw_events)))
+            finished = not raw_events or next_position >= int(page.get("totalMatches") or next_position)
+            if not dry_run:
+                self.store.update_backfill_job(job_id, next_position=next_position, oldest_event_time=oldest,
+                                               newest_event_time=newest, complete=finished, **totals)
+            if totals["scanned"] and totals["scanned"] % 1000 < max(1, len(raw_events)):
+                LOG.info("Backfill progress: scanned=%s matched=%s delivered=%s existing=%s", totals["scanned"],
+                         totals["matched"], totals["delivered"], totals["already_existing"])
+            if finished:
+                return totals | {"oldest_event_time": oldest, "newest_event_time": newest, "complete": True,
+                                 "dry_run": dry_run}
+            position = next_position
+        return totals | {"oldest_event_time": oldest, "newest_event_time": newest, "complete": False,
+                         "dry_run": dry_run}
+
     def health(self) -> dict[str, Any]:
         try:
             self.device.test_connection() if hasattr(self.device, "test_connection") else self.device.device_info()
@@ -434,9 +499,27 @@ def install_signal_handlers(agent: AttendanceAgent) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="EPCA ONE Hikvision attendance agent")
-    parser.add_argument("command", choices=["test-device", "test-cloud", "sync-once", "health", "run", "discover-users",
-                                            "event-capabilities"])
+    commands = parser.add_subparsers(dest="command", required=True)
+    for command in ("test-device", "test-cloud", "sync-once", "health", "run", "discover-users", "event-capabilities"):
+        commands.add_parser(command)
+    backfill_parser = commands.add_parser("backfill", help="Safely import historical attendance without changing live cursor")
+    backfill_parser.add_argument("--from", dest="range_from", metavar="YYYY-MM-DD", help="First device-local date, inclusive")
+    backfill_parser.add_argument("--to", dest="range_to", metavar="YYYY-MM-DD", help="Last device-local date, inclusive")
+    backfill_parser.add_argument("--all", action="store_true", help="Scan all terminal history")
+    backfill_parser.add_argument("--dry-run", action="store_true", help="Scan and report only; never send or checkpoint")
     args = parser.parse_args()
+    if args.command == "backfill":
+        if args.all and (args.range_from or args.range_to):
+            parser.error("backfill accepts --all or --from/--to, not both")
+        if not args.all and not (args.range_from and args.range_to):
+            parser.error("backfill requires --all or both --from YYYY-MM-DD and --to YYYY-MM-DD")
+        try:
+            range_from = date.fromisoformat(args.range_from) if args.range_from else None
+            range_to = date.fromisoformat(args.range_to) if args.range_to else None
+        except ValueError:
+            parser.error("backfill dates must use YYYY-MM-DD")
+        if range_from and range_from > range_to:
+            parser.error("backfill --from must be on or before --to")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         load_project_env(APP_DIR / ".env")  # real environment variables take precedence
@@ -459,6 +542,17 @@ def main() -> int:
             result = agent.device.discover_users()
             result["users"] = [{k: v for k, v in user.items() if k != "raw"} for user in result["users"]]
             print(result)
+        elif args.command == "backfill":
+            install_signal_handlers(agent)
+            result = agent.backfill(range_from, range_to, all_history=args.all, dry_run=args.dry_run)
+            print("Historical attendance backfill" + (" (dry run)" if args.dry_run else ""))
+            print(f"Range: {'all history' if args.all else f'{range_from} -> {range_to}'}")
+            for label, key in (("Scanned", "scanned"), ("Matched attendance", "matched"),
+                               ("Delivered", "delivered"), ("Already existing", "already_existing"),
+                               ("Unmapped", "unmapped"), ("Rejected", "rejected"), ("Failed", "failed"),
+                               ("Oldest imported event", "oldest_event_time"), ("Newest imported event", "newest_event_time")):
+                print(f"{label}: {result.get(key, 0) if result.get(key) is not None else '-'}")
+            print("Backfill complete" if result.get("complete") else "Backfill interrupted; rerun the same range to resume")
         else:
             install_signal_handlers(agent)
             agent.run()

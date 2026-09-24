@@ -72,6 +72,19 @@ class AgentStore:
             );
             CREATE INDEX IF NOT EXISTS queued_events_delivery_idx
                 ON queued_events(delivery_status, serial_no);
+            -- Deliberately separate from queued_events: a historical import must never
+            -- participate in, or advance, the live discovery cursor.
+            CREATE TABLE IF NOT EXISTS backfill_jobs (
+                job_id TEXT PRIMARY KEY,
+                range_from TEXT, range_to TEXT, is_all INTEGER NOT NULL,
+                next_position INTEGER NOT NULL DEFAULT 0,
+                scanned INTEGER NOT NULL DEFAULT 0, matched INTEGER NOT NULL DEFAULT 0,
+                delivered INTEGER NOT NULL DEFAULT 0, already_existing INTEGER NOT NULL DEFAULT 0,
+                unmapped INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0,
+                oldest_event_time TEXT, newest_event_time TEXT,
+                started_at TEXT NOT NULL, updated_at TEXT NOT NULL, completed_at TEXT
+            );
         """)
         self.connection.commit()
 
@@ -192,3 +205,25 @@ class AgentStore:
         counts = {"pending": 0, "delivered": 0, "rejected": 0}
         counts.update({row["delivery_status"]: row["count"] for row in rows})
         return counts
+
+    def backfill_job(self, job_id: str, range_from: str | None, range_to: str | None, is_all: bool) -> dict[str, Any]:
+        """Return a durable, independent historical-import checkpoint."""
+        now = _now()
+        with self.connection:
+            self.connection.execute(
+                "INSERT OR IGNORE INTO backfill_jobs(job_id, range_from, range_to, is_all, started_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)", (job_id, range_from, range_to, int(is_all), now, now))
+        return dict(self.connection.execute("SELECT * FROM backfill_jobs WHERE job_id=?", (job_id,)).fetchone())
+
+    def update_backfill_job(self, job_id: str, *, next_position: int, scanned: int, matched: int,
+                            delivered: int, already_existing: int, unmapped: int, rejected: int,
+                            failed: int, oldest_event_time: str | None, newest_event_time: str | None,
+                            complete: bool = False) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE backfill_jobs SET next_position=?, scanned=?, matched=?, delivered=?, "
+                "already_existing=?, unmapped=?, rejected=?, failed=?, oldest_event_time=?, newest_event_time=?, "
+                "updated_at=?, completed_at=CASE WHEN ? THEN ? ELSE completed_at END WHERE job_id=?",
+                (next_position, scanned, matched, delivered, already_existing, unmapped, rejected, failed,
+                 oldest_event_time, newest_event_time, _now(), int(complete), _now(), job_id),
+            )
