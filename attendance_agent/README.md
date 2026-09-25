@@ -278,6 +278,36 @@ there. A dry run writes nothing to SQLite, so a new dry run starts from position
 `HIKVISION_BACKFILL_PAGE_SIZE` (default and maximum `10`, the firmware's AcsEvent limit) applies only to
 backfill.
 
+**Throttling.** Every page is a separate request with a fresh Digest login, and a full scan of the
+DS-K1T8003MF log takes thousands of them. `HIKVISION_BACKFILL_PAGE_DELAY_SECONDS` (default `0.25`,
+decimals allowed, `0` disables it) pauses after each successfully processed page. There is no pause
+after the final page, and none in live polling. Retry backoff is separate and unchanged. Ctrl+C during
+the pause stops at once, and a real backfill has already checkpointed that page.
+
+**Authentication cooldowns during backfill.** A 401 still triggers the client's normal cooldown, which
+is also saved in SQLite so a restart cannot log in during it. It is never treated as an ordinary
+transient retry. A plain Hikvision 401 does not say *why* the login was rejected. Only `lockStatus=lock`
+with `unlockTime` is distinguishable, and a lock also follows repeated rejected logins. So the firmware
+alone cannot tell a wrong password from a terminal worn down by heavy access. Backfill uses what the run
+itself has seen:
+
+* If the first request of a run gets a 401 or lock, the credentials are not proven. The run stops.
+* If an earlier page in this run authenticated with the same credentials, backfill waits out the
+  cooldown (the device's `unlockTime` plus margin for a lock, or the auth cooldown for a plain 401),
+  then retries the same page once.
+* A 401 right after such a wait stops the run. So does exceeding `HIKVISION_BACKFILL_MAX_COOLDOWN_WAITS`
+  (default `3`; `0` restores fail-fast).
+
+At worst, a password changed on the terminal during a run costs one extra rejected login.
+
+**Diagnostic start position.** `--start-position N` is accepted only together with `--dry-run`. It starts
+the diagnostic scan at `searchResultPosition` N instead of 0, so a scan that failed deep into the log
+can continue without re-reading everything before it. It writes nothing: no checkpoint and no live
+cursor. The report marks it as a diagnostic offset, because events before N are not counted. A real
+backfill rejects the option; it always resumes from its own checkpoint. A failed or interrupted dry run
+prints the exact `--start-position` to continue from. Positions are only as stable as the terminal's
+log, so an offset is for diagnosis, never for deciding what was imported.
+
 **Why a short range still scans the whole log.** The query sends only the `AcsEventCond` fields proven
 on this firmware (`searchID`, `searchResultPosition`, `maxResults`, `major`, `minor`), and the date range
 is applied locally to each event's unconverted device-local `time`. `startTime`/`endTime` filtering is

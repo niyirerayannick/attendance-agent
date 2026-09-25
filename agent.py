@@ -304,7 +304,14 @@ class AttendanceAgent:
 
         Every attempt is a new device request, so it gets the client's fresh Session + Digest negotiation.
         Returns None when a stop was requested during a backoff wait. Once the retries are exhausted the
-        DeviceTransientError propagates; cooldowns (401/lock) and HTTP errors are never retried here.
+        DeviceTransientError propagates; HTTP errors are never retried here.
+
+        A 401/lock cooldown is not a transient retry. The client has already paused itself and persisted the
+        cooldown. A plain Hikvision 401 does not say whether the password is wrong or the terminal is
+        overloaded, so the only evidence used is this run's: the page is retried after the cooldown only when
+        an earlier page of this run authenticated successfully, never twice in a row without a successful
+        page in between, and at most HIKVISION_BACKFILL_MAX_COOLDOWN_WAITS times. Otherwise the
+        DeviceCooldownError propagates with run["cooldown_refusal"] explaining why.
         """
         cfg = self.config
         timeout = (cfg.backfill_connect_timeout_seconds, cfg.backfill_read_timeout_seconds)
@@ -312,7 +319,34 @@ class AttendanceAgent:
         attempt = 1
         while True:
             try:
-                return self.device.search_events_page(position, max_results=cfg.backfill_page_size, timeout=timeout)
+                page = self.device.search_events_page(position, max_results=cfg.backfill_page_size, timeout=timeout)
+                run["_authenticated"], run["_cooldown_pending"] = True, False
+                return page
+            except DeviceCooldownError as exc:
+                run["cooldown_failures"] += 1
+                if not run["_authenticated"]:
+                    run["cooldown_refusal"] = ("no page of this run has authenticated yet, so the credentials are "
+                                               "not proven; rerun after the cooldown and check "
+                                               "HIKVISION_USERNAME/HIKVISION_PASSWORD if it recurs")
+                elif run["_cooldown_pending"]:
+                    run["cooldown_refusal"] = ("authentication failed again right after waiting out a cooldown; "
+                                               "not retrying a possibly rejected password")
+                elif run["cooldown_waits"] >= cfg.backfill_max_cooldown_waits:
+                    run["cooldown_refusal"] = (f"HIKVISION_BACKFILL_MAX_COOLDOWN_WAITS="
+                                               f"{cfg.backfill_max_cooldown_waits} cooldown wait(s) already used")
+                else:
+                    # +1s so the wait never ends a fraction before the client's own cooldown does.
+                    delay = math.ceil(exc.retry_after) + 1
+                    run["cooldown_waits"] += 1
+                    run["_cooldown_pending"] = True
+                    LOG.warning("Backfill page %s (searchResultPosition=%s): Hikvision %s cooldown after this run "
+                                "had already authenticated; waiting %s seconds (cooldown wait %s/%s), then retrying "
+                                "the same position once.", page_number, position, exc.kind, delay,
+                                run["cooldown_waits"], cfg.backfill_max_cooldown_waits)
+                    if self.stop_requested.wait(delay):
+                        return None
+                    continue
+                raise
             except DeviceTransientError as exc:
                 run["transient_errors"] += 1
                 if attempt >= attempts:
@@ -326,21 +360,28 @@ class AttendanceAgent:
                 attempt += 1
 
     def backfill(self, range_from: date | None, range_to: date | None, *, all_history: bool = False,
-                 dry_run: bool = False) -> dict[str, Any]:
+                 dry_run: bool = False, start_position: int | None = None) -> dict[str, Any]:
         """Import a date-bounded AcsEvent history without touching live queue/cursor state.
 
         The search position only moves after a page was received and processed; a real run checkpoints it
         only after EPCA acknowledged the page, so an interrupted cloud request is safely replayed by serial.
         A timed-out page is retried at the same position (see _fetch_backfill_page). A dry run keeps its
-        position in memory only: it writes nothing to SQLite and a new dry run starts from position 0.
+        position in memory only: it writes nothing to SQLite and a new dry run starts from position 0,
+        or from ``start_position``, a diagnostic offset allowed only for dry runs. Successive pages are
+        spaced by HIKVISION_BACKFILL_PAGE_DELAY_SECONDS.
         """
+        if start_position is not None:
+            if not dry_run:  # a real backfill only ever resumes from its own durable checkpoint
+                raise ValueError("start_position is a diagnostic option and is only allowed with dry_run.")
+            if start_position < 0:
+                raise ValueError("start_position must be zero or greater.")
         from_text = range_from.isoformat() if range_from else None
         to_text = range_to.isoformat() if range_to else None
         job_id = "all" if all_history else f"{from_text}:{to_text}"
         keys = ("scanned", "matched", "delivered", "already_existing", "unmapped", "rejected", "failed")
         if dry_run:  # no backfill_jobs row at all: a dry run cannot later result in delivery
             totals = {key: 0 for key in keys}
-            position, oldest, newest = 0, None, None
+            position, oldest, newest = start_position or 0, None, None
         else:
             job = self.store.backfill_job(job_id, from_text, to_text, all_history)
             if job["completed_at"]:
@@ -351,32 +392,51 @@ class AttendanceAgent:
         # returned events in serialNo/time order across positions (evidence for any future early stop).
         run: dict[str, Any] = {
             "range_from": from_text, "range_to": to_text, "all_history": all_history, "dry_run": dry_run,
-            "start_position": position, "pages": 0, "retries": 0, "transient_errors": 0, "total_matches": None,
+            "start_position": position, "diagnostic_start_position": start_position is not None,
+            "pages": 0, "retries": 0, "transient_errors": 0, "cooldown_failures": 0, "cooldown_waits": 0,
+            "cooldown_refusal": None, "total_matches": None,
             "first_matched_event_time": None, "last_matched_event_time": None, "last_event_time": None,
-            "serial_regressions": 0, "time_regressions": 0}
+            "serial_regressions": 0, "time_regressions": 0, "_authenticated": False, "_cooldown_pending": False}
         last_serial: int | None = None
         latest_instant: datetime | None = None
+        started = self.clock()
 
         def report(complete: bool) -> dict[str, Any]:
-            return totals | run | {"oldest_event_time": oldest, "newest_event_time": newest,
-                                   "next_position": position, "complete": complete}
+            elapsed = max(0.0, self.clock() - started)
+            # Every fetch attempt that reached the terminal: successful pages plus failed attempts.
+            requests_sent = run["pages"] + run["transient_errors"] + run["cooldown_failures"]
+            public = {key: value for key, value in run.items() if not key.startswith("_")}
+            return totals | public | {
+                "oldest_event_time": oldest, "newest_event_time": newest, "next_position": position,
+                "complete": complete, "elapsed_seconds": round(elapsed, 1), "device_requests": requests_sent,
+                "pages_per_minute": round(run["pages"] * 60 / elapsed, 1) if elapsed > 0 else None,
+                "requests_per_second": round(requests_sent / elapsed, 2) if elapsed > 0 else None}
 
         cfg = self.config
         LOG.info("Backfill starting: range=%s dry_run=%s start_position=%s page_size=%s connect_timeout=%ss "
-                 "read_timeout=%ss max_retries=%s", "all history" if all_history else f"{from_text}..{to_text}",
-                 dry_run, position, cfg.backfill_page_size, cfg.backfill_connect_timeout_seconds,
-                 cfg.backfill_read_timeout_seconds, cfg.backfill_max_retries)
+                 "read_timeout=%ss max_retries=%s page_delay=%ss", "all history" if all_history
+                 else f"{from_text}..{to_text}", dry_run, position, cfg.backfill_page_size,
+                 cfg.backfill_connect_timeout_seconds, cfg.backfill_read_timeout_seconds, cfg.backfill_max_retries,
+                 cfg.backfill_page_delay_seconds)
+        if start_position is not None:
+            LOG.warning("DIAGNOSTIC dry-run scan offset: starting at searchResultPosition=%s. Positions before it "
+                        "are NOT scanned, so the counts cover only part of the range.", start_position)
         while not self.stop_requested.is_set():
             page_number = run["pages"] + 1
             try:
                 page = self._fetch_backfill_page(position, page_number, run)
-            except DeviceTransientError as exc:
-                resume = ("Dry run: nothing was checkpointed; a new dry run starts again from position 0."
-                          if dry_run else f"The checkpoint remains at position {position}; rerun the same range "
-                                          "to resume from there.")
+            except (DeviceTransientError, DeviceCooldownError) as exc:
+                resume = (f"Dry run: nothing was checkpointed; to continue this diagnostic scan use "
+                          f"--dry-run --start-position {position}." if dry_run
+                          else f"The checkpoint remains at position {position}; rerun the same range "
+                               "to resume from there.")
+                if isinstance(exc, DeviceCooldownError):
+                    reason = f"Hikvision authentication/cooldown: {exc} Not retried: {run['cooldown_refusal']}."
+                else:
+                    reason = f"{cfg.backfill_max_retries + 1} attempt(s) failed: {exc}."
                 raise BackfillPageError(
-                    f"Backfill page {page_number} (searchResultPosition={position}) could not be retrieved after "
-                    f"{cfg.backfill_max_retries + 1} attempt(s): {exc}. {resume}", report(False)) from exc
+                    f"Backfill page {page_number} (searchResultPosition={position}) could not be retrieved; "
+                    f"{reason} {resume}", report(False)) from exc
             if page is None:
                 break
             run["pages"] += 1
@@ -438,6 +498,10 @@ class AttendanceAgent:
                          run["last_event_time"], run["retries"])
             if finished:
                 return report(True)
+            # Throttle: an older terminal needs breathing room between thousands of fresh Digest logins.
+            # Ctrl+C/SIGTERM ends the wait immediately; the processed page is already checkpointed.
+            if cfg.backfill_page_delay_seconds > 0 and self.stop_requested.wait(cfg.backfill_page_delay_seconds):
+                break
         return report(False)
 
     def health(self) -> dict[str, Any]:
@@ -593,6 +657,9 @@ def print_backfill_report(result: dict[str, Any], dry_run: bool, failure: str | 
     requested = ("all history" if result.get("all_history") or result.get("is_all")
                  else f"{result.get('range_from')} -> {result.get('range_to')}")
     print(f"Requested range: {requested} (device-local dates)")
+    if result.get("diagnostic_start_position"):
+        print(f"DIAGNOSTIC scan offset: started at searchResultPosition {result.get('start_position')}; earlier "
+              "positions were NOT scanned, so the counts below cover only part of the range.")
     rows = [("Scanned", "scanned"), ("Matched attendance", "matched")]
     if dry_run:
         rows += [("First matched event", "first_matched_event_time"), ("Last matched event", "last_matched_event_time"),
@@ -601,25 +668,30 @@ def print_backfill_report(result: dict[str, Any], dry_run: bool, failure: str | 
         rows += [("Delivered", "delivered"), ("Already existing", "already_existing"), ("Unmapped", "unmapped"),
                  ("Rejected", "rejected"), ("Failed", "failed"),
                  ("Oldest imported event", "oldest_event_time"), ("Newest imported event", "newest_event_time")]
-    rows += [("Pages scanned (this run)", "pages"), ("Timeouts/connection errors (this run)", "transient_errors"),
-             ("Page retries (this run)", "retries"), ("Last event time seen", "last_event_time"),
-             ("Out-of-order serialNo / time (this run)", None)]
+    rows += [("Total events reported by terminal", "total_matches"), ("Start position", "start_position"),
+             ("Ending position", "next_position"), ("Pages fetched (this run)", "pages"),
+             ("Device requests (this run)", "device_requests"), ("Page retries (this run)", "retries"),
+             ("Timeouts/connection errors (this run)", "transient_errors"),
+             ("Authentication/cooldown failures (this run)", "cooldown_failures"),
+             ("Cooldown waits (this run)", "cooldown_waits"), ("Elapsed seconds", "elapsed_seconds"),
+             ("Average pages per minute", "pages_per_minute"), ("Average requests per second", "requests_per_second"),
+             ("Last event time seen", "last_event_time"), ("Out-of-order serialNo / time (this run)", None)]
     for label, key in rows:
         if key is None:
             print(f"{label}: {show(result.get('serial_regressions'))} / {show(result.get('time_regressions'))}")
         else:
             print(f"{label}: {show(result.get(key, 0))}")
-    print(f"Search position: {show(result.get('start_position'))} -> {show(result.get('next_position'))} "
-          f"of {show(result.get('total_matches'))}")
     if dry_run:
         print("Dry run: nothing was sent to EPCA ONE and no checkpoint was written.")
     if failure:
         print(f"Backfill FAILED: {failure}")
     elif result.get("complete"):
         print("Backfill complete")
+    elif dry_run:
+        print(f"Backfill interrupted; to continue this diagnostic scan use --dry-run --start-position "
+              f"{show(result.get('next_position'))}")
     else:
-        print("Backfill interrupted; " + ("rerun to scan again from the start" if dry_run
-                                          else "rerun the same range to resume"))
+        print("Backfill interrupted; rerun the same range to resume")
 
 
 def main() -> int:
@@ -630,12 +702,16 @@ def main() -> int:
     backfill_parser = commands.add_parser(
         "backfill", help="Safely import historical attendance without changing live cursor",
         epilog="Tuning (.env): HIKVISION_BACKFILL_CONNECT_TIMEOUT (default 10), HIKVISION_BACKFILL_READ_TIMEOUT "
-               "(60), HIKVISION_BACKFILL_PAGE_SIZE (10, max 10), HIKVISION_BACKFILL_MAX_RETRIES (4). A page that "
-               "times out is retried at the same position after 2s, 5s, 10s, 20s.")
+               "(60), HIKVISION_BACKFILL_PAGE_SIZE (10, max 10), HIKVISION_BACKFILL_MAX_RETRIES (4), "
+               "HIKVISION_BACKFILL_PAGE_DELAY_SECONDS (0.25), HIKVISION_BACKFILL_MAX_COOLDOWN_WAITS (3). A page "
+               "that times out is retried at the same position after 2s, 5s, 10s, 20s.")
     backfill_parser.add_argument("--from", dest="range_from", metavar="YYYY-MM-DD", help="First device-local date, inclusive")
     backfill_parser.add_argument("--to", dest="range_to", metavar="YYYY-MM-DD", help="Last device-local date, inclusive")
     backfill_parser.add_argument("--all", action="store_true", help="Scan all terminal history")
     backfill_parser.add_argument("--dry-run", action="store_true", help="Scan and report only; never send or checkpoint")
+    backfill_parser.add_argument("--start-position", type=int, metavar="N",
+                                 help="DIAGNOSTIC, --dry-run only: start scanning at searchResultPosition N "
+                                      "(positions before N are not scanned; nothing is written)")
     args = parser.parse_args()
     if args.command == "backfill":
         if args.all and (args.range_from or args.range_to):
@@ -649,6 +725,12 @@ def main() -> int:
             parser.error("backfill dates must use YYYY-MM-DD")
         if range_from and range_from > range_to:
             parser.error("backfill --from must be on or before --to")
+        if args.start_position is not None:
+            if not args.dry_run:
+                parser.error("--start-position is a diagnostic option and requires --dry-run; a real backfill "
+                             "always resumes from its own checkpoint")
+            if args.start_position < 0:
+                parser.error("--start-position must be zero or greater")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     try:
         load_project_env(APP_DIR / ".env")  # real environment variables take precedence
@@ -674,7 +756,8 @@ def main() -> int:
         elif args.command == "backfill":
             install_signal_handlers(agent)
             try:
-                result = agent.backfill(range_from, range_to, all_history=args.all, dry_run=args.dry_run)
+                result = agent.backfill(range_from, range_to, all_history=args.all, dry_run=args.dry_run,
+                                        start_position=args.start_position)
             except BackfillPageError as exc:
                 print_backfill_report(exc.result, args.dry_run, failure=str(exc))
                 LOG.error("%s", exc)

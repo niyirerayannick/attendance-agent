@@ -18,17 +18,19 @@ import requests
 from requests.auth import HTTPDigestAuth
 
 try:
-    from attendance_agent.agent import AttendanceAgent, BackfillPageError, print_backfill_report
+    from attendance_agent.agent import (DEVICE_COOLDOWN_STATE_KEY, AttendanceAgent, BackfillPageError,
+                                        print_backfill_report)
     from attendance_agent.cloud import CloudError
     from attendance_agent.config import AgentConfig, ConfigurationError
-    from attendance_agent.hikvision import (DeviceAuthenticationError, DeviceError, DeviceTransientError,
-                                            HikvisionClient)
+    from attendance_agent.hikvision import (DeviceAuthenticationError, DeviceError, DeviceLockedError,
+                                            DeviceTransientError, HikvisionClient)
     from attendance_agent.storage import AgentStore
 except ModuleNotFoundError:
-    from agent import AttendanceAgent, BackfillPageError, print_backfill_report
+    from agent import DEVICE_COOLDOWN_STATE_KEY, AttendanceAgent, BackfillPageError, print_backfill_report
     from cloud import CloudError
     from config import AgentConfig, ConfigurationError
-    from hikvision import DeviceAuthenticationError, DeviceError, DeviceTransientError, HikvisionClient
+    from hikvision import (DeviceAuthenticationError, DeviceError, DeviceLockedError, DeviceTransientError,
+                           HikvisionClient)
     from storage import AgentStore
 
 
@@ -60,7 +62,8 @@ class ScriptedDevice:
     """Session factory for HikvisionClient serving an oldest-first AcsEvent log.
 
     ``script`` maps a searchResultPosition to the outcomes of successive requests at that position:
-    an exception instance is raised, an int is returned as that HTTP status, OK serves the page.
+    an exception instance is raised, an int (or (int, body bytes)) is returned as that HTTP response,
+    OK serves the page.
     """
     def __init__(self, log, script=None):
         self.log, self.script = log, {k: list(v) for k, v in (script or {}).items()}
@@ -81,7 +84,10 @@ class ScriptedDevice:
                 if isinstance(outcome, BaseException):
                     raise outcome
                 if outcome != OK:
-                    return FakeResponse(outcome)
+                    status, content = outcome if isinstance(outcome, tuple) else (outcome, b"")
+                    response = FakeResponse(status)
+                    response.content = content
+                    return response
                 page = device.log[position:position + body["maxResults"]]
                 return FakeResponse(200, {"AcsEvent": {"searchID": "1", "numOfMatches": len(page),
                                                        "totalMatches": len(device.log), "InfoList": page,
@@ -97,13 +103,21 @@ class ScriptedDevice:
         return [position for position, *_ in self.requests]
 
 
+class FakeClock:
+    """Monotonic clock shared by the client cooldown, the agent's elapsed time and RecordingStop waits."""
+    def __init__(self): self.now = 1000.0
+    def __call__(self): return self.now
+
+
 class RecordingStop(threading.Event):
-    """Replaces agent.stop_requested: records backoff waits instead of sleeping."""
+    """Replaces agent.stop_requested: records backoff/throttle waits and advances the fake clock."""
     def __init__(self, on_wait=None, stop_on_wait=False):
         super().__init__()
-        self.waits, self.on_wait, self.stop_on_wait = [], on_wait, stop_on_wait
+        self.waits, self.on_wait, self.stop_on_wait, self.clock = [], on_wait, stop_on_wait, None
     def wait(self, timeout=None):
         self.waits.append(timeout)
+        if self.clock is not None:
+            self.clock.now += timeout or 0
         if self.on_wait:
             self.on_wait()
         if self.stop_on_wait:
@@ -137,9 +151,13 @@ class BackfillRetryTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def agent(self, device, cloud=None, stop=None, **overrides):
-        client = HikvisionClient(config(self.db_path, **overrides), session_factory=device.session)
+        # Retry tests run unthrottled so their exact backoff waits stay visible; throttle tests override it.
+        overrides = {"backfill_page_delay_seconds": 0} | overrides
+        clock = FakeClock()
+        client = HikvisionClient(config(self.db_path, **overrides), session_factory=device.session, clock=clock)
         agent = AttendanceAgent(config(self.db_path, **overrides), self.store, client, cloud or FakeCloud())
         agent.stop_requested = stop or RecordingStop()
+        agent.stop_requested.clock = agent.clock = clock
         return agent
 
     def job(self):
@@ -283,12 +301,16 @@ class BackfillRetryTests(unittest.TestCase):
         self.assertEqual((device.positions[0], result["matched"]), (0, 25))
         self.assertEqual(self.job()["next_position"], 10)
 
-    def test_authentication_cooldown_is_never_retried(self):
+    def test_authentication_failure_on_first_request_is_never_retried(self):
         device = ScriptedDevice([event(1)], {0: [401]})
         agent = self.agent(device)
-        with self.assertRaises(DeviceAuthenticationError):
+        with self.assertRaises(BackfillPageError) as caught:
             agent.backfill(*self.RANGE, dry_run=True)
+        self.assertIsInstance(caught.exception.__cause__, DeviceAuthenticationError)
+        self.assertIn("credentials are not proven", str(caught.exception))
         self.assertEqual((device.positions, agent.stop_requested.waits), ([0], []))
+        self.assertEqual((caught.exception.result["cooldown_failures"], caught.exception.result["cooldown_waits"]),
+                         (1, 0))
 
     def test_http_errors_are_not_retried(self):
         device = ScriptedDevice([event(1)], {0: [500]})
@@ -368,6 +390,210 @@ class BackfillQueryTests(unittest.TestCase):
                          ("2026-09-20T00:00:00+02:00", "2026-09-20T23:59:59+02:00"))
 
 
+LOCKED_401 = (401, b"<userCheck><statusValue>401</statusValue><statusString>Unauthorized</statusString>"
+                   b"<lockStatus>lock</lockStatus><unlockTime>120</unlockTime><retryLoginTime>0</retryLoginTime>"
+                   b"</userCheck>")
+
+
+class BackfillThrottleTests(unittest.TestCase):
+    RANGE = BackfillRetryTests.RANGE
+    setUp, tearDown, agent, job = (BackfillRetryTests.setUp, BackfillRetryTests.tearDown, BackfillRetryTests.agent,
+                                   BackfillRetryTests.job)
+
+    def test_throttle_between_successful_pages_but_not_after_the_last(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)])
+        agent = self.agent(device, backfill_page_delay_seconds=0.25)
+        result = agent.backfill(*self.RANGE, dry_run=True)
+        self.assertTrue(result["complete"])
+        self.assertEqual(device.positions, [0, 10, 20])
+        self.assertEqual(agent.stop_requested.waits, [0.25, 0.25])
+        # Elapsed/rates come from the same clock: 3 pages and 3 requests in 0.5 seconds.
+        self.assertEqual((result["elapsed_seconds"], result["device_requests"], result["pages_per_minute"],
+                          result["requests_per_second"]), (0.5, 3, 360.0, 6.0))
+
+    def test_single_page_is_never_throttled(self):
+        agent = self.agent(ScriptedDevice([event(1)]), backfill_page_delay_seconds=5)
+        agent.backfill(*self.RANGE, dry_run=True)
+        self.assertEqual(agent.stop_requested.waits, [])
+
+    def test_zero_delay_disables_the_throttle(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)])
+        agent = self.agent(device, backfill_page_delay_seconds=0)
+        result = agent.backfill(*self.RANGE, dry_run=True)
+        self.assertEqual((device.positions, agent.stop_requested.waits, result["matched"]), ([0, 10, 20], [], 25))
+
+    def test_retry_backoff_is_unchanged_and_throttle_only_follows_success(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)], {10: [requests.ReadTimeout(), requests.ReadTimeout()]})
+        agent = self.agent(device, backfill_page_delay_seconds=0.5)
+        result = agent.backfill(*self.RANGE, dry_run=True)
+        self.assertEqual(device.positions, [0, 10, 10, 10, 20])
+        self.assertEqual(agent.stop_requested.waits, [0.5, 2, 5, 0.5])
+        self.assertEqual((result["retries"], result["transient_errors"], result["device_requests"]), (2, 2, 5))
+
+    def test_live_polling_is_never_throttled(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)])
+        agent = self.agent(device, backfill_page_delay_seconds=5)
+        agent.poll_device()
+        self.assertEqual(agent.stop_requested.waits, [])
+
+    def test_ctrl_c_during_throttle_exits_cleanly(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)])
+        cloud = FakeCloud()
+        agent = self.agent(device, cloud, stop=RecordingStop(stop_on_wait=True), backfill_page_delay_seconds=0.25)
+        result = agent.backfill(*self.RANGE)  # no exception
+        self.assertFalse(result["complete"])
+        self.assertEqual((device.positions, agent.stop_requested.waits), ([0], [0.25]))
+        self.assertEqual((result["next_position"], self.job()["next_position"]), (10, 10))  # page 1 was acknowledged
+        self.assertIsNone(self.job()["completed_at"])
+        self.assertEqual(cloud.sent, [list(range(1, 11))])
+
+
+class BackfillCooldownTests(unittest.TestCase):
+    RANGE = BackfillRetryTests.RANGE
+    setUp, tearDown, agent, job = (BackfillRetryTests.setUp, BackfillRetryTests.tearDown, BackfillRetryTests.agent,
+                                   BackfillRetryTests.job)
+
+    def test_auth_cooldown_after_proven_login_waits_and_retries_the_same_page(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)], {10: [401]})
+        agent = self.agent(device)
+        result = agent.backfill(*self.RANGE, dry_run=True)
+        self.assertTrue(result["complete"])
+        self.assertEqual(device.positions, [0, 10, 10, 20])
+        self.assertEqual(agent.stop_requested.waits, [301])  # the client's 300s cooldown, +1s margin
+        self.assertEqual((result["cooldown_failures"], result["cooldown_waits"], result["matched"]), (1, 1, 25))
+        # The existing cooldown persistence is reused (restart safety), not bypassed.
+        self.assertIsNotNone(self.store.get_state(DEVICE_COOLDOWN_STATE_KEY))
+
+    def test_account_lock_waits_for_the_device_reported_unlock_time(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)], {10: [LOCKED_401]})
+        agent = self.agent(device)
+        result = agent.backfill(*self.RANGE, dry_run=True)
+        self.assertTrue(result["complete"])
+        self.assertEqual(agent.stop_requested.waits, [151])  # unlockTime 120 + 30s margin, +1s
+        self.assertEqual(device.positions, [0, 10, 10, 20])
+
+    def test_real_backfill_checkpoint_survives_a_cooldown_wait(self):
+        seen = []
+        device = ScriptedDevice([event(n) for n in range(1, 26)], {10: [401]})
+        stop = RecordingStop(on_wait=lambda: seen.append(self.job()["next_position"]))
+        cloud = FakeCloud()
+        result = self.agent(device, cloud, stop).backfill(*self.RANGE)
+        self.assertEqual(seen, [10])
+        self.assertEqual((result["complete"], result["delivered"]), (True, 25))
+        self.assertEqual([len(batch) for batch in cloud.sent], [10, 10, 5])  # nothing sent twice
+
+    def test_second_consecutive_auth_failure_is_not_retried(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)], {10: [401, 401]})
+        agent = self.agent(device)
+        with self.assertRaises(BackfillPageError) as caught:
+            agent.backfill(*self.RANGE, dry_run=True)
+        self.assertIn("failed again right after waiting out a cooldown", str(caught.exception))
+        self.assertIn("--start-position 10", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, DeviceAuthenticationError)
+        self.assertEqual((device.positions, agent.stop_requested.waits), ([0, 10, 10], [301]))
+        self.assertEqual((caught.exception.result["cooldown_failures"], caught.exception.result["cooldown_waits"]),
+                         (2, 1))
+
+    def test_first_request_lock_is_not_waited_out(self):
+        device = ScriptedDevice([event(1)], {0: [LOCKED_401]})
+        agent = self.agent(device)
+        with self.assertRaises(BackfillPageError) as caught:
+            agent.backfill(*self.RANGE, dry_run=True)
+        self.assertIsInstance(caught.exception.__cause__, DeviceLockedError)
+        self.assertEqual((device.positions, agent.stop_requested.waits), ([0], []))
+
+    def test_cooldown_waits_are_bounded_per_run(self):
+        device = ScriptedDevice([event(n) for n in range(1, 46)], {10: [401], 20: [401], 30: [401]})
+        agent = self.agent(device, backfill_max_cooldown_waits=2)
+        with self.assertRaises(BackfillPageError) as caught:
+            agent.backfill(*self.RANGE, dry_run=True)
+        self.assertIn("HIKVISION_BACKFILL_MAX_COOLDOWN_WAITS=2", str(caught.exception))
+        self.assertEqual(agent.stop_requested.waits, [301, 301])  # a success in between resets the doubling
+        self.assertEqual(device.positions, [0, 10, 10, 20, 20, 30])
+
+    def test_zero_cooldown_waits_keeps_the_fail_fast_behaviour(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)], {10: [401]})
+        agent = self.agent(device, backfill_max_cooldown_waits=0)
+        with self.assertRaises(BackfillPageError):
+            agent.backfill(*self.RANGE, dry_run=True)
+        self.assertEqual((device.positions, agent.stop_requested.waits), ([0, 10], []))
+
+    def test_ctrl_c_during_cooldown_wait_exits_cleanly(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)], {10: [401]})
+        agent = self.agent(device, stop=RecordingStop(stop_on_wait=True))
+        result = agent.backfill(*self.RANGE, dry_run=True)
+        self.assertEqual((result["complete"], result["next_position"], device.positions), (False, 10, [0, 10]))
+
+
+class DiagnosticStartPositionTests(unittest.TestCase):
+    RANGE = BackfillRetryTests.RANGE
+    setUp, tearDown, agent, job = (BackfillRetryTests.setUp, BackfillRetryTests.tearDown, BackfillRetryTests.agent,
+                                   BackfillRetryTests.job)
+
+    def test_dry_run_starts_at_the_offset_and_writes_nothing(self):
+        self.store.commit_discovery([], cursor=900)
+        before = dict(self.store.connection.execute("SELECT key, value FROM agent_state").fetchall())
+        device = ScriptedDevice([event(n) for n in range(1, 26)])
+        with self.assertLogs("epca_attendance_agent", level="WARNING") as logs:
+            result = self.agent(device).backfill(*self.RANGE, dry_run=True, start_position=10)
+        self.assertEqual(device.positions, [10, 20])
+        self.assertEqual((result["scanned"], result["matched"], result["start_position"], result["next_position"],
+                          result["diagnostic_start_position"], result["complete"]), (15, 15, 10, 25, True, True))
+        self.assertTrue(any("DIAGNOSTIC dry-run scan offset" in line for line in logs.output))
+        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM backfill_jobs").fetchone()[0], 0)
+        self.assertEqual(dict(self.store.connection.execute("SELECT key, value FROM agent_state").fetchall()), before)
+        self.assertEqual(self.store.discovery_cursor, 900)
+
+    def test_start_position_is_rejected_for_a_real_backfill(self):
+        device = ScriptedDevice([event(n) for n in range(1, 26)])
+        with self.assertRaises(ValueError):
+            self.agent(device).backfill(*self.RANGE, start_position=10)
+        self.assertEqual(device.positions, [])
+        self.assertIsNone(self.job())  # no checkpoint row created or altered
+
+    def test_negative_start_position_is_rejected(self):
+        device = ScriptedDevice([event(1)])
+        with self.assertRaises(ValueError):
+            self.agent(device).backfill(*self.RANGE, dry_run=True, start_position=-1)
+        self.assertEqual(device.positions, [])
+
+    def test_start_position_zero_is_a_normal_full_dry_run(self):
+        device = ScriptedDevice([event(n) for n in range(1, 16)])
+        result = self.agent(device).backfill(*self.RANGE, dry_run=True, start_position=0)
+        self.assertEqual((device.positions, result["matched"]), ([0, 10], 15))
+
+    def test_cli_rejects_invalid_start_position_before_touching_anything(self):
+        agent_module = __import__(AttendanceAgent.__module__, fromlist=["main"])
+        base = ["agent.py", "backfill", "--from", "2026-09-20", "--to", "2026-09-20"]
+        for extra in (["--start-position", "14000"], ["--dry-run", "--start-position", "-1"],
+                      ["--dry-run", "--start-position", "abc"]):
+            with self.subTest(extra=extra), patch("sys.argv", base + extra), \
+                    patch.object(agent_module, "AttendanceAgent") as constructed, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    agent_module.main()
+                self.assertEqual(caught.exception.code, 2)
+                constructed.assert_not_called()
+
+    def test_cli_rejects_start_position_without_dry_run_with_a_clear_message(self):
+        agent_module = __import__(AttendanceAgent.__module__, fromlist=["main"])
+        with patch("sys.argv", ["agent.py", "backfill", "--from", "2026-09-20", "--to", "2026-09-20",
+                                "--start-position", "14000"]), contextlib.redirect_stderr(io.StringIO()) as errors:
+            with self.assertRaises(SystemExit):
+                agent_module.main()
+        self.assertIn("--start-position is a diagnostic option and requires --dry-run", errors.getvalue())
+
+    def test_report_marks_the_diagnostic_offset(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_backfill_report({"range_from": "2026-09-20", "range_to": "2026-09-20", "start_position": 14000,
+                                   "diagnostic_start_position": True, "next_position": 14410, "complete": False},
+                                  True)
+        text = output.getvalue()
+        self.assertIn("DIAGNOSTIC scan offset: started at searchResultPosition 14000", text)
+        self.assertIn("to continue this diagnostic scan use --dry-run --start-position 14410", text)
+
+
 class BackfillClientTests(unittest.TestCase):
     def client(self, error):
         class Session:
@@ -409,6 +635,18 @@ class BackfillConfigTests(unittest.TestCase):
         self.assertEqual((cfg.backfill_connect_timeout_seconds, cfg.backfill_read_timeout_seconds,
                           cfg.backfill_page_size, cfg.backfill_max_retries), (5, 120, 5, 0))
 
+    def test_page_delay_and_cooldown_waits(self):
+        cfg = self.load()
+        self.assertEqual((cfg.backfill_page_delay_seconds, cfg.backfill_max_cooldown_waits), (0.25, 3))
+        for text, value in (("0", 0.0), ("1.5", 1.5), ("0.05", 0.05), ("2", 2.0)):
+            self.assertEqual(self.load(HIKVISION_BACKFILL_PAGE_DELAY_SECONDS=text).backfill_page_delay_seconds, value)
+        self.assertEqual(self.load(HIKVISION_BACKFILL_MAX_COOLDOWN_WAITS="0").backfill_max_cooldown_waits, 0)
+        for bad in ("-0.1", "abc", "nan", "inf", ""):
+            with self.subTest(bad=bad), self.assertRaises(ConfigurationError):
+                self.load(HIKVISION_BACKFILL_PAGE_DELAY_SECONDS=bad)
+        with self.assertRaises(ConfigurationError):
+            self.load(HIKVISION_BACKFILL_MAX_COOLDOWN_WAITS="-1")
+
     def test_invalid_values_are_rejected(self):
         for name, value in (("HIKVISION_BACKFILL_PAGE_SIZE", "11"), ("HIKVISION_BACKFILL_PAGE_SIZE", "0"),
                             ("HIKVISION_BACKFILL_READ_TIMEOUT", "0"), ("HIKVISION_BACKFILL_CONNECT_TIMEOUT", "x"),
@@ -432,9 +670,9 @@ class BackfillReportTests(unittest.TestCase):
                             "total_matches": 46000, "complete": False}, True, failure="page 201 failed")
         for line in ("Historical attendance backfill (dry run)", "Requested range: 2026-09-20 -> 2026-09-20",
                      "Scanned: 2000", "Matched attendance: 3", "First matched event: 2026-09-20T07:01:00+02:00",
-                     "Last matched event: 2026-09-20T17:30:00+02:00", "Pages scanned (this run): 200",
+                     "Last matched event: 2026-09-20T17:30:00+02:00", "Pages fetched (this run): 200",
                      "Timeouts/connection errors (this run): 2", "Page retries (this run): 2",
-                     "Search position: 0 -> 2000 of 46000",
+                     "Total events reported by terminal: 46000", "Start position: 0", "Ending position: 2000",
                      "Dry run: nothing was sent to EPCA ONE and no checkpoint was written.",
                      "Backfill FAILED: page 201 failed"):
             self.assertIn(line, text)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,6 +90,16 @@ def _non_negative_int(name: str, default: int) -> int:
     return value
 
 
+def _non_negative_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a number.") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ConfigurationError(f"{name} must be zero or greater.")
+    return value
+
+
 def _boolean(name: str, default: bool) -> bool:
     value = os.getenv(name, str(default)).lower().strip()
     if value in {"1", "true", "yes", "on"}:
@@ -138,6 +149,12 @@ class AgentConfig:
     backfill_page_size: int = 10
     # A page that times out is retried at the same position after 2s, 5s, 10s, 20s, 20s ...
     backfill_max_retries: int = 4
+    # Pause between successfully processed backfill pages, so thousands of fresh Digest logins do not
+    # overload the terminal. Not applied to live polling, retries, or after the final page.
+    backfill_page_delay_seconds: float = 0.25
+    # Waits for an authentication/lock cooldown before retrying the same page; only after this run already
+    # authenticated successfully, and never twice in a row without a successful page in between.
+    backfill_max_cooldown_waits: int = 3
 
     def __post_init__(self) -> None:
         if not 1 <= self.poll_interval_seconds <= MAX_POLL_INTERVAL_SECONDS:
@@ -191,4 +208,6 @@ class AgentConfig:
             backfill_read_timeout_seconds=_positive_int("HIKVISION_BACKFILL_READ_TIMEOUT", 60),
             backfill_page_size=_positive_int("HIKVISION_BACKFILL_PAGE_SIZE", 10),
             backfill_max_retries=_non_negative_int("HIKVISION_BACKFILL_MAX_RETRIES", 4),
+            backfill_page_delay_seconds=_non_negative_float("HIKVISION_BACKFILL_PAGE_DELAY_SECONDS", 0.25),
+            backfill_max_cooldown_waits=_non_negative_int("HIKVISION_BACKFILL_MAX_COOLDOWN_WAITS", 3),
         )
