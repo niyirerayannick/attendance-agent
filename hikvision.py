@@ -51,6 +51,13 @@ class DeviceError(RuntimeError):
     pass
 
 
+class DeviceTransientError(DeviceError):
+    """The request never produced an HTTP response (connect/read timeout, connection reset).
+
+    A read-only AcsEvent search can simply be repeated. HTTP errors, 401s and TLS failures are not transient.
+    """
+
+
 class DeviceCooldownError(DeviceError):
     """Device requests are paused; ``retry_after`` is the number of seconds until one is permitted again."""
     kind = "cooldown"
@@ -311,7 +318,8 @@ class HikvisionClient:
             f"Hikvision authentication failed ({detail}); check the configured Hikvision username/password. "
             f"Pausing device requests for approximately {round(seconds)} seconds.")
 
-    def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+    def _request(self, method: str, path: str, timeout: float | tuple[float, float] | None = None,
+                 **kwargs: Any) -> requests.Response:
         with self._lock:
             after_cooldown = self._check_cooldown()
             # DS-K1T8003MF V1.3.37 rejects a Digest nonce reused from an earlier poll (every reuse ended in
@@ -319,7 +327,7 @@ class HikvisionClient:
             # normal negotiation internally: unauthenticated challenge (401) -> Digest request -> response.
             # That internal challenge is never seen here and is not an authentication failure.
             self.reset_session()
-            response = self._send(method, path, **kwargs)
+            response = self._send(method, path, timeout, **kwargs)
             if response.status_code == 401:
                 # A final 401 after a clean negotiation with fresh state is a genuine failure: no retry
                 # (another attempt would only spend a login), straight to lockout/cooldown protection.
@@ -333,15 +341,20 @@ class HikvisionClient:
                 self._auth_failures = 0
             return self._check(method, path, response)
 
-    def _send(self, method: str, path: str, **kwargs: Any) -> requests.Response:
+    def _send(self, method: str, path: str, timeout: float | tuple[float, float] | None = None,
+              **kwargs: Any) -> requests.Response:
         try:
             return self.session.request(
-                method, f"{self.config.hikvision_base_url}{path}", timeout=self.config.device_timeout_seconds,
+                method, f"{self.config.hikvision_base_url}{path}",
+                timeout=self.config.device_timeout_seconds if timeout is None else timeout,
                 verify=self.config.hikvision_verify_tls, **kwargs,
             )
         except requests.RequestException as exc:
             LOG.warning("Hikvision %s %s failed: %s", method, path, exc.__class__.__name__)
-            raise DeviceError(f"Device request failed: {method} {path}: {exc.__class__.__name__}") from exc
+            message = f"Device request failed: {method} {path}: {exc.__class__.__name__}"
+            transient = (isinstance(exc, (requests.Timeout, requests.ConnectionError))
+                         and not isinstance(exc, requests.exceptions.SSLError))
+            raise (DeviceTransientError if transient else DeviceError)(message) from exc
 
     def _check(self, method: str, path: str, response: requests.Response) -> requests.Response:
         try:
@@ -368,9 +381,12 @@ class HikvisionClient:
     def test_connection(self) -> dict[str, Any]:
         return self.device_info()
 
-    def search_events_page(self, position: int = 0, search_id: str | None = None,
-                           max_results: int | None = None) -> dict[str, Any]:
-        """Fetch one AcsEvent page; raw InfoList entries are returned untouched (timestamps included)."""
+    def search_events_page(self, position: int = 0, search_id: str | None = None, max_results: int | None = None,
+                           timeout: float | tuple[float, float] | None = None) -> dict[str, Any]:
+        """Fetch one AcsEvent page; raw InfoList entries are returned untouched (timestamps included).
+
+        ``timeout`` (seconds, or a requests (connect, read) tuple) defaults to DEVICE_TIMEOUT_SECONDS.
+        """
         condition = {"searchID": str(search_id or ACS_EVENT_SEARCH_ID), "searchResultPosition": int(position),
                      "maxResults": int(max_results or self.config.event_page_size),
                      "major": int(self.config.event_major), "minor": int(self.config.event_minor)}
@@ -380,7 +396,7 @@ class HikvisionClient:
                  condition["searchID"], condition["searchResultPosition"], condition["maxResults"],
                  condition["major"], condition["minor"])
         LOG.debug("Hikvision AcsEventCond request body: %s", body)
-        response = self._request("POST", ACS_EVENT_PATH, data=body.encode("utf-8"),
+        response = self._request("POST", ACS_EVENT_PATH, timeout=timeout, data=body.encode("utf-8"),
                                  headers={"Accept": "application/json", "Content-Type": "application/json"})
         try:
             payload = response.json()

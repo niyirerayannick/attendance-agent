@@ -209,7 +209,7 @@ Optional settings are `HIKVISION_SCHEME` (default `http`), `HIKVISION_VERIFY_TLS
 `true`), `DEVICE_TIMEOUT_SECONDS`, `CLOUD_TIMEOUT_SECONDS`, `BATCH_SIZE`, `EVENT_PAGE_SIZE`, and
 `MAX_PAGES_PER_POLL` (default `EVENT_PAGE_SIZE=10`), `RETRY_INITIAL_SECONDS` / `RETRY_MAX_SECONDS` (default `5` / `300`), `HIKVISION_EVENT_MAJOR` / `HIKVISION_EVENT_MINOR`
 (default `5` / `38`, fingerprint verified), `HIKVISION_LOCK_DEFAULT_SECONDS` / `HIKVISION_LOCK_MARGIN_SECONDS` /
-`HIKVISION_AUTH_COOLDOWN_SECONDS` (default `1800` / `30` / `300`), `LOG_LEVEL` (default `INFO`), and the initial-sync settings below. `AGENT_DATABASE_PATH=/data/attendance_agent.db` can override the default,
+`HIKVISION_AUTH_COOLDOWN_SECONDS` (default `1800` / `30` / `300`), `LOG_LEVEL` (default `INFO`), the backfill-only `HIKVISION_BACKFILL_*` settings (see Historical backfill), and the initial-sync settings below. `AGENT_DATABASE_PATH=/data/attendance_agent.db` can override the default,
 but should remain inside the persistent volume. EPCA HTTPS certificate verification is always on.
 
 ### First start: recent events only
@@ -251,6 +251,43 @@ image, and verify `health`. For rollback, redeploy the previous image with the e
 volume and environment variables. To back up state, stop the application first and archive the
 entire persistent volume (database plus WAL files), or use SQLite's online backup tooling; never
 copy only the main database while it is actively being written.
+
+### Historical backfill
+
+Historical imports are explicit and never change `last_discovered_serial` or the live delivery queue:
+
+```bash
+sudo systemctl stop epca-attendance-agent
+./.venv/bin/python agent.py backfill --from 2025-01-01 --to 2026-09-24
+sudo systemctl start epca-attendance-agent
+```
+
+Use `--all` only when the complete terminal history is intended. `--dry-run` scans and reports matching punches without sending anything or recording a checkpoint. A normal backfill stores a separate range-keyed page checkpoint in SQLite; rerun the exact same range after interruption. Pages are checkpointed only after EPCA acknowledges them, so replay is safe through EPCA's device-and-serial idempotency. Stop the service first to avoid concurrent terminal access; the command never controls systemd itself.
+
+**Timeouts and retries.** Deep history pages are answered much more slowly than the newest ones, so
+backfill uses its own timeouts: `HIKVISION_BACKFILL_CONNECT_TIMEOUT` (default `10`) and
+`HIKVISION_BACKFILL_READ_TIMEOUT` (default `60`). Live polling keeps `DEVICE_TIMEOUT_SECONDS`. If a page
+fails with a connect/read timeout or a connection reset, the same `searchResultPosition` is requested
+again after 2, 5, 10 and 20 seconds (`HIKVISION_BACKFILL_MAX_RETRIES`, default `4`; the 20-second wait
+repeats for any extra retries). Each attempt uses a fresh Digest session. HTTP 401 or a lockout is never
+retried: it triggers the normal cooldown. HTTP errors are not retried either. The position only moves after
+a page was received and processed, so a dry run that retries continues where it was instead of starting
+over. If every attempt fails, the command prints its partial report plus `Backfill FAILED`, and exits 2.
+A real backfill's checkpoint then still points at the failed page, so rerunning the same range resumes
+there. A dry run writes nothing to SQLite, so a new dry run starts from position 0.
+`HIKVISION_BACKFILL_PAGE_SIZE` (default and maximum `10`, the firmware's AcsEvent limit) applies only to
+backfill.
+
+**Why a short range still scans the whole log.** The query sends only the `AcsEventCond` fields proven
+on this firmware (`searchID`, `searchResultPosition`, `maxResults`, `major`, `minor`), and the date range
+is applied locally to each event's unconverted device-local `time`. `startTime`/`endTime` filtering is
+not used because it has not been verified on the DS-K1T8003MF V1.3.37: its accepted time format, its
+timezone handling and whether positions stay stable under a filter are all unknown. Run
+`agent.py event-capabilities` (read-only) to see what the firmware advertises. The terminal returns
+matches oldest-first by `serialNo`, and live polling depends on that order. Event *times* are not
+guaranteed to be monotonic, though: a clock correction can put an earlier date after a later one. So the
+scan never stops early once it passes `--to`. Each report shows `Out-of-order serialNo / time` so the
+real ordering can be measured before any early stop is considered.
 
 ## Verification and tests
 

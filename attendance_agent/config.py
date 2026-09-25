@@ -24,6 +24,8 @@ MAX_POLL_INTERVAL_SECONDS = 86_400
 # The DS-K1T8003MF (V1.3.37) locks its account after repeated authentication failures; polling faster
 # than this is only recommended after a soak test proves it stable. The agent warns but never overrides.
 RECOMMENDED_MIN_POLL_INTERVAL_SECONDS = 15
+# DS-K1T8003MF V1.3.37 accepts at most 10 results per AcsEvent page (same limit as UserInfoSearch).
+MAX_BACKFILL_PAGE_SIZE = 10
 
 
 def load_project_env(env_file: str | os.PathLike[str] | None = None) -> bool:
@@ -129,12 +131,21 @@ class AgentConfig:
     hikvision_lock_margin_seconds: int = 30
     # After a 401 survives the one fresh-session retry: 300s, doubling per repeat, capped at one hour.
     hikvision_auth_cooldown_seconds: int = 300
+    # Historical backfill only (live polling keeps device_timeout_seconds / event_page_size): deep
+    # searchResultPosition pages are answered much more slowly than the newest ones.
+    backfill_connect_timeout_seconds: int = 10
+    backfill_read_timeout_seconds: int = 60
+    backfill_page_size: int = 10
+    # A page that times out is retried at the same position after 2s, 5s, 10s, 20s, 20s ...
+    backfill_max_retries: int = 4
 
     def __post_init__(self) -> None:
         if not 1 <= self.poll_interval_seconds <= MAX_POLL_INTERVAL_SECONDS:
             raise ConfigurationError(f"POLL_INTERVAL_SECONDS must be between 1 and {MAX_POLL_INTERVAL_SECONDS}.")
         if self.retry_initial_seconds < 1 or self.retry_max_seconds < self.retry_initial_seconds:
             raise ConfigurationError("RETRY_MAX_SECONDS must be >= RETRY_INITIAL_SECONDS >= 1.")
+        if not 1 <= self.backfill_page_size <= MAX_BACKFILL_PAGE_SIZE:
+            raise ConfigurationError(f"HIKVISION_BACKFILL_PAGE_SIZE must be between 1 and {MAX_BACKFILL_PAGE_SIZE}.")
 
     @property
     def hikvision_base_url(self) -> str:
@@ -176,4 +187,8 @@ class AgentConfig:
             hikvision_lock_default_seconds=_positive_int("HIKVISION_LOCK_DEFAULT_SECONDS", 1800),
             hikvision_lock_margin_seconds=_non_negative_int("HIKVISION_LOCK_MARGIN_SECONDS", 30),
             hikvision_auth_cooldown_seconds=_positive_int("HIKVISION_AUTH_COOLDOWN_SECONDS", 300),
+            backfill_connect_timeout_seconds=_positive_int("HIKVISION_BACKFILL_CONNECT_TIMEOUT", 10),
+            backfill_read_timeout_seconds=_positive_int("HIKVISION_BACKFILL_READ_TIMEOUT", 60),
+            backfill_page_size=_positive_int("HIKVISION_BACKFILL_PAGE_SIZE", 10),
+            backfill_max_retries=_non_negative_int("HIKVISION_BACKFILL_MAX_RETRIES", 4),
         )

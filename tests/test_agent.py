@@ -42,11 +42,11 @@ class FakeDevice:
     @property
     def calls(self): return len(self.positions)
     def device_info(self): return {"deviceName": "Terminal"}
-    def search_events_page(self, position):
+    def search_events_page(self, position, max_results=None, timeout=None):
         self.positions.append(position)
         if position >= len(self.log) and self.log:
             raise DeviceError("badParameters: position past the end")  # never request past the end
-        page = self.log[position:position + self.page_size]
+        page = self.log[position:position + (max_results or self.page_size)]
         return {"events": page, "numOfMatches": len(page), "totalMatches": len(self.log),
                 "responseStatusStrg": "MORE" if position + len(page) < len(self.log) else "OK",
                 "more": position + len(page) < len(self.log)}

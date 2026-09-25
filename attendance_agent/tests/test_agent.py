@@ -3,7 +3,7 @@ import tempfile
 import threading
 import unittest
 from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,11 +42,11 @@ class FakeDevice:
     @property
     def calls(self): return len(self.positions)
     def device_info(self): return {"deviceName": "Terminal"}
-    def search_events_page(self, position):
+    def search_events_page(self, position, max_results=None, timeout=None):
         self.positions.append(position)
         if position >= len(self.log) and self.log:
             raise DeviceError("badParameters: position past the end")  # never request past the end
-        page = self.log[position:position + self.page_size]
+        page = self.log[position:position + (max_results or self.page_size)]
         return {"events": page, "numOfMatches": len(page), "totalMatches": len(self.log),
                 "responseStatusStrg": "MORE" if position + len(page) < len(self.log) else "OK",
                 "more": position + len(page) < len(self.log)}
@@ -322,6 +322,46 @@ class InitialSyncTests(unittest.TestCase):
                          (32, "2", "2022-05-11T13:00:49+08:00"))
         self.assertEqual((event["major"], event["minor"], event["attendance_status"]), (5, 38, "undefined"))
         self.assertEqual(event["raw_payload"]["userType"], "normal")
+
+
+class BackfillTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = str(Path(self.tmp.name) / "queue.sqlite3")
+        self.store = AgentStore(self.db_path)
+
+    def tearDown(self):
+        self.store.close(); self.tmp.cleanup()
+
+    def agent(self, events, cloud=None):
+        return AttendanceAgent(config(self.db_path), self.store, FakeDevice(events=events), cloud or FakeCloud())
+
+    def test_backfill_is_paginated_and_does_not_change_live_cursor(self):
+        events = [raw(n) | {"time": "2026-01-02T08:00:00+02:00"} for n in range(1, 26)]
+        self.store.commit_discovery([], cursor=900)
+        cloud = FakeCloud({"created": 25, "duplicates": 0, "errors": 0})
+        result = self.agent(events, cloud).backfill(date(2026, 1, 2), date(2026, 1, 2))
+        self.assertTrue(result["complete"])
+        self.assertEqual(self.store.discovery_cursor, 900)
+        self.assertEqual(self.agent(events).device.positions, [])
+        self.assertEqual([len(batch) for batch in cloud.sent], [10, 10, 5])
+
+    def test_dry_run_never_sends_or_creates_live_queue_entries(self):
+        cloud = FakeCloud({"created": 1})
+        result = self.agent([raw(1)], cloud).backfill(date(2026, 9, 21), date(2026, 9, 21), dry_run=True)
+        self.assertEqual((result["matched"], cloud.sent, self.store.queue_counts()["pending"], self.store.discovery_cursor),
+                         (1, [], 0, 0))
+
+    def test_cloud_failure_replays_uncheckpointed_page_and_duplicates_are_idempotent(self):
+        events = [raw(n) for n in range(1, 3)]
+        failing = FakeCloud(error=CloudError("offline"))
+        agent = self.agent(events, failing)
+        with self.assertRaises(CloudError):
+            agent.backfill(date(2026, 9, 21), date(2026, 9, 21))
+        self.assertEqual(self.store.backfill_job("2026-09-21:2026-09-21", "2026-09-21", "2026-09-21", False)["next_position"], 0)
+        cloud = FakeCloud({"created": 0, "duplicates": 2, "errors": 0})
+        result = self.agent(events, cloud).backfill(date(2026, 9, 21), date(2026, 9, 21))
+        self.assertEqual((result["already_existing"], result["delivered"]), (2, 0))
 
 
 class ScriptedStop(threading.Event):

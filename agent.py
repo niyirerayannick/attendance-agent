@@ -24,12 +24,13 @@ try:  # Package imports work inside EPCA ONE until this directory is extracted.
     from attendance_agent.cloud import CloudAuthenticationError, CloudError, EpcClient
     from attendance_agent.config import (RECOMMENDED_MIN_POLL_INTERVAL_SECONDS, AgentConfig, ConfigurationError,
                                          load_project_env)
-    from attendance_agent.hikvision import MAX_LOCK_SECONDS, DeviceCooldownError, DeviceError, HikvisionClient
+    from attendance_agent.hikvision import (MAX_LOCK_SECONDS, DeviceCooldownError, DeviceError, DeviceTransientError,
+                                            HikvisionClient)
     from attendance_agent.storage import AgentStore, StorageError
 except ModuleNotFoundError:  # Standalone repository: modules live beside agent.py.
     from cloud import CloudAuthenticationError, CloudError, EpcClient
     from config import RECOMMENDED_MIN_POLL_INTERVAL_SECONDS, AgentConfig, ConfigurationError, load_project_env
-    from hikvision import MAX_LOCK_SECONDS, DeviceCooldownError, DeviceError, HikvisionClient
+    from hikvision import MAX_LOCK_SECONDS, DeviceCooldownError, DeviceError, DeviceTransientError, HikvisionClient
     from storage import AgentStore, StorageError
 
 
@@ -46,6 +47,17 @@ BACKFILL_HIGH_SERIAL_KEY = "event_backfill_high_serial"
 DEVICE_COOLDOWN_STATE_KEY = "hikvision_cooldown_until"
 # While nothing happens, the run loop logs one INFO status line per interval instead of one per poll.
 HEARTBEAT_SECONDS = 3600
+# Wait before each retry of a backfill page that timed out; the last value repeats for further retries.
+BACKFILL_RETRY_DELAYS = (2, 5, 10, 20)
+# One INFO progress line per this many scanned events; DEBUG logs every page.
+BACKFILL_PROGRESS_EVERY = 1000
+
+
+class BackfillPageError(DeviceError):
+    """A historical page could not be fetched after every retry; ``result`` is the run's partial report."""
+    def __init__(self, message: str, result: dict[str, Any]):
+        super().__init__(message)
+        self.result = result
 
 
 @dataclass
@@ -287,26 +299,89 @@ class AttendanceAgent:
                  result["delivery"]["delivered"], result["delivery"]["rejected"])
         return result
 
+    def _fetch_backfill_page(self, position: int, page_number: int, run: dict[str, Any]) -> dict[str, Any] | None:
+        """Fetch one historical page, retrying the SAME position after a timeout/connection error.
+
+        Every attempt is a new device request, so it gets the client's fresh Session + Digest negotiation.
+        Returns None when a stop was requested during a backoff wait. Once the retries are exhausted the
+        DeviceTransientError propagates; cooldowns (401/lock) and HTTP errors are never retried here.
+        """
+        cfg = self.config
+        timeout = (cfg.backfill_connect_timeout_seconds, cfg.backfill_read_timeout_seconds)
+        attempts = cfg.backfill_max_retries + 1
+        attempt = 1
+        while True:
+            try:
+                return self.device.search_events_page(position, max_results=cfg.backfill_page_size, timeout=timeout)
+            except DeviceTransientError as exc:
+                run["transient_errors"] += 1
+                if attempt >= attempts:
+                    raise
+                delay = BACKFILL_RETRY_DELAYS[min(attempt, len(BACKFILL_RETRY_DELAYS)) - 1]
+                run["retries"] += 1
+                LOG.warning("Backfill page %s (searchResultPosition=%s) attempt %s/%s failed (%s); retrying the "
+                            "same position in %s seconds.", page_number, position, attempt, attempts, exc, delay)
+                if self.stop_requested.wait(delay):
+                    return None
+                attempt += 1
+
     def backfill(self, range_from: date | None, range_to: date | None, *, all_history: bool = False,
                  dry_run: bool = False) -> dict[str, Any]:
         """Import a date-bounded AcsEvent history without touching live queue/cursor state.
 
-        Checkpoint advancement occurs only after a page was either inspected in dry-run mode or
-        acknowledged by EPCA.  Thus an interrupted cloud request is safely replayed by serial.
+        The search position only moves after a page was received and processed; a real run checkpoints it
+        only after EPCA acknowledged the page, so an interrupted cloud request is safely replayed by serial.
+        A timed-out page is retried at the same position (see _fetch_backfill_page). A dry run keeps its
+        position in memory only: it writes nothing to SQLite and a new dry run starts from position 0.
         """
         from_text = range_from.isoformat() if range_from else None
         to_text = range_to.isoformat() if range_to else None
         job_id = "all" if all_history else f"{from_text}:{to_text}"
-        job = self.store.backfill_job(job_id, from_text, to_text, all_history)
-        if job["completed_at"] and not dry_run:
-            return job | {"complete": True, "resumed": True}
-        totals = {key: int(job[key]) for key in ("scanned", "matched", "delivered", "already_existing", "unmapped", "rejected", "failed")}
-        position, oldest, newest = int(job["next_position"]), job["oldest_event_time"], job["newest_event_time"]
-        # A dry run intentionally has no durable checkpoint: it cannot later result in delivery.
-        if dry_run:
-            totals = {key: 0 for key in totals}; position = 0; oldest = newest = None
+        keys = ("scanned", "matched", "delivered", "already_existing", "unmapped", "rejected", "failed")
+        if dry_run:  # no backfill_jobs row at all: a dry run cannot later result in delivery
+            totals = {key: 0 for key in keys}
+            position, oldest, newest = 0, None, None
+        else:
+            job = self.store.backfill_job(job_id, from_text, to_text, all_history)
+            if job["completed_at"]:
+                return job | {"complete": True, "resumed": True}
+            totals = {key: int(job[key]) for key in keys}
+            position, oldest, newest = int(job["next_position"]), job["oldest_event_time"], job["newest_event_time"]
+        # Per-run diagnostics, never checkpointed. The *_regressions counters record whether this terminal
+        # returned events in serialNo/time order across positions (evidence for any future early stop).
+        run: dict[str, Any] = {
+            "range_from": from_text, "range_to": to_text, "all_history": all_history, "dry_run": dry_run,
+            "start_position": position, "pages": 0, "retries": 0, "transient_errors": 0, "total_matches": None,
+            "first_matched_event_time": None, "last_matched_event_time": None, "last_event_time": None,
+            "serial_regressions": 0, "time_regressions": 0}
+        last_serial: int | None = None
+        latest_instant: datetime | None = None
+
+        def report(complete: bool) -> dict[str, Any]:
+            return totals | run | {"oldest_event_time": oldest, "newest_event_time": newest,
+                                   "next_position": position, "complete": complete}
+
+        cfg = self.config
+        LOG.info("Backfill starting: range=%s dry_run=%s start_position=%s page_size=%s connect_timeout=%ss "
+                 "read_timeout=%ss max_retries=%s", "all history" if all_history else f"{from_text}..{to_text}",
+                 dry_run, position, cfg.backfill_page_size, cfg.backfill_connect_timeout_seconds,
+                 cfg.backfill_read_timeout_seconds, cfg.backfill_max_retries)
         while not self.stop_requested.is_set():
-            page = self.device.search_events_page(position)
+            page_number = run["pages"] + 1
+            try:
+                page = self._fetch_backfill_page(position, page_number, run)
+            except DeviceTransientError as exc:
+                resume = ("Dry run: nothing was checkpointed; a new dry run starts again from position 0."
+                          if dry_run else f"The checkpoint remains at position {position}; rerun the same range "
+                                          "to resume from there.")
+                raise BackfillPageError(
+                    f"Backfill page {page_number} (searchResultPosition={position}) could not be retrieved after "
+                    f"{cfg.backfill_max_retries + 1} attempt(s): {exc}. {resume}", report(False)) from exc
+            if page is None:
+                break
+            run["pages"] += 1
+            if page.get("totalMatches") is not None:
+                run["total_matches"] = int(page["totalMatches"])
             raw_events = page["events"]
             selected: list[dict[str, Any]] = []
             for raw in raw_events:
@@ -314,6 +389,15 @@ class AttendanceAgent:
                 event = event_from_isapi(raw)
                 if event is None:
                     continue
+                run["last_event_time"] = event["event_time"]
+                if last_serial is not None and event["serial_no"] <= last_serial:
+                    run["serial_regressions"] += 1
+                last_serial = event["serial_no"]
+                instant = _event_instant(event["event_time"])
+                if instant is not None:
+                    if latest_instant is not None and instant < latest_instant:
+                        run["time_regressions"] += 1
+                    latest_instant = instant if latest_instant is None else max(latest_instant, instant)
                 # The unmodified timestamp string defines the device-local calendar date.
                 try:
                     event_day = date.fromisoformat(event["event_time"][:10])
@@ -323,6 +407,8 @@ class AttendanceAgent:
                     continue
                 selected.append(event)
                 totals["matched"] += 1
+                run["first_matched_event_time"] = run["first_matched_event_time"] or event["event_time"]
+                run["last_matched_event_time"] = event["event_time"]
                 oldest = min(filter(None, [oldest, event["event_time"]]), default=event["event_time"])
                 newest = max(filter(None, [newest, event["event_time"]]), default=event["event_time"])
             if not dry_run and selected:
@@ -342,15 +428,17 @@ class AttendanceAgent:
             if not dry_run:
                 self.store.update_backfill_job(job_id, next_position=next_position, oldest_event_time=oldest,
                                                newest_event_time=newest, complete=finished, **totals)
-            if totals["scanned"] and totals["scanned"] % 1000 < max(1, len(raw_events)):
-                LOG.info("Backfill progress: scanned=%s matched=%s delivered=%s existing=%s", totals["scanned"],
-                         totals["matched"], totals["delivered"], totals["already_existing"])
-            if finished:
-                return totals | {"oldest_event_time": oldest, "newest_event_time": newest, "complete": True,
-                                 "dry_run": dry_run}
+            LOG.debug("Backfill page %s: searchResultPosition=%s returned=%s totalMatches=%s last_event_time=%s",
+                      page_number, position, len(raw_events), run["total_matches"], run["last_event_time"])
             position = next_position
-        return totals | {"oldest_event_time": oldest, "newest_event_time": newest, "complete": False,
-                         "dry_run": dry_run}
+            if finished or (totals["scanned"] and totals["scanned"] % BACKFILL_PROGRESS_EVERY < max(1, len(raw_events))):
+                LOG.info("Backfill progress: scanned=%s matched=%s delivered=%s existing=%s page=%s position=%s/%s "
+                         "last_event_time=%s retries=%s", totals["scanned"], totals["matched"], totals["delivered"],
+                         totals["already_existing"], run["pages"], position, run["total_matches"],
+                         run["last_event_time"], run["retries"])
+            if finished:
+                return report(True)
+        return report(False)
 
     def health(self) -> dict[str, Any]:
         try:
@@ -497,12 +585,53 @@ def install_signal_handlers(agent: AttendanceAgent) -> None:
     signal.signal(signal.SIGINT, handle_shutdown)
 
 
+def print_backfill_report(result: dict[str, Any], dry_run: bool, failure: str | None = None) -> None:
+    """Print the operator summary of one backfill run; contains no credentials or tokens."""
+    def show(value: Any) -> Any:
+        return "-" if value is None else value
+    print("Historical attendance backfill" + (" (dry run)" if dry_run else ""))
+    requested = ("all history" if result.get("all_history") or result.get("is_all")
+                 else f"{result.get('range_from')} -> {result.get('range_to')}")
+    print(f"Requested range: {requested} (device-local dates)")
+    rows = [("Scanned", "scanned"), ("Matched attendance", "matched")]
+    if dry_run:
+        rows += [("First matched event", "first_matched_event_time"), ("Last matched event", "last_matched_event_time"),
+                 ("Oldest matched event", "oldest_event_time"), ("Newest matched event", "newest_event_time")]
+    else:
+        rows += [("Delivered", "delivered"), ("Already existing", "already_existing"), ("Unmapped", "unmapped"),
+                 ("Rejected", "rejected"), ("Failed", "failed"),
+                 ("Oldest imported event", "oldest_event_time"), ("Newest imported event", "newest_event_time")]
+    rows += [("Pages scanned (this run)", "pages"), ("Timeouts/connection errors (this run)", "transient_errors"),
+             ("Page retries (this run)", "retries"), ("Last event time seen", "last_event_time"),
+             ("Out-of-order serialNo / time (this run)", None)]
+    for label, key in rows:
+        if key is None:
+            print(f"{label}: {show(result.get('serial_regressions'))} / {show(result.get('time_regressions'))}")
+        else:
+            print(f"{label}: {show(result.get(key, 0))}")
+    print(f"Search position: {show(result.get('start_position'))} -> {show(result.get('next_position'))} "
+          f"of {show(result.get('total_matches'))}")
+    if dry_run:
+        print("Dry run: nothing was sent to EPCA ONE and no checkpoint was written.")
+    if failure:
+        print(f"Backfill FAILED: {failure}")
+    elif result.get("complete"):
+        print("Backfill complete")
+    else:
+        print("Backfill interrupted; " + ("rerun to scan again from the start" if dry_run
+                                          else "rerun the same range to resume"))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="EPCA ONE Hikvision attendance agent")
     commands = parser.add_subparsers(dest="command", required=True)
     for command in ("test-device", "test-cloud", "sync-once", "health", "run", "discover-users", "event-capabilities"):
         commands.add_parser(command)
-    backfill_parser = commands.add_parser("backfill", help="Safely import historical attendance without changing live cursor")
+    backfill_parser = commands.add_parser(
+        "backfill", help="Safely import historical attendance without changing live cursor",
+        epilog="Tuning (.env): HIKVISION_BACKFILL_CONNECT_TIMEOUT (default 10), HIKVISION_BACKFILL_READ_TIMEOUT "
+               "(60), HIKVISION_BACKFILL_PAGE_SIZE (10, max 10), HIKVISION_BACKFILL_MAX_RETRIES (4). A page that "
+               "times out is retried at the same position after 2s, 5s, 10s, 20s.")
     backfill_parser.add_argument("--from", dest="range_from", metavar="YYYY-MM-DD", help="First device-local date, inclusive")
     backfill_parser.add_argument("--to", dest="range_to", metavar="YYYY-MM-DD", help="Last device-local date, inclusive")
     backfill_parser.add_argument("--all", action="store_true", help="Scan all terminal history")
@@ -544,15 +673,15 @@ def main() -> int:
             print(result)
         elif args.command == "backfill":
             install_signal_handlers(agent)
-            result = agent.backfill(range_from, range_to, all_history=args.all, dry_run=args.dry_run)
-            print("Historical attendance backfill" + (" (dry run)" if args.dry_run else ""))
-            print(f"Range: {'all history' if args.all else f'{range_from} -> {range_to}'}")
-            for label, key in (("Scanned", "scanned"), ("Matched attendance", "matched"),
-                               ("Delivered", "delivered"), ("Already existing", "already_existing"),
-                               ("Unmapped", "unmapped"), ("Rejected", "rejected"), ("Failed", "failed"),
-                               ("Oldest imported event", "oldest_event_time"), ("Newest imported event", "newest_event_time")):
-                print(f"{label}: {result.get(key, 0) if result.get(key) is not None else '-'}")
-            print("Backfill complete" if result.get("complete") else "Backfill interrupted; rerun the same range to resume")
+            try:
+                result = agent.backfill(range_from, range_to, all_history=args.all, dry_run=args.dry_run)
+            except BackfillPageError as exc:
+                print_backfill_report(exc.result, args.dry_run, failure=str(exc))
+                LOG.error("%s", exc)
+                return 2
+            finally:
+                agent.store.close()
+            print_backfill_report(result, args.dry_run)
         else:
             install_signal_handlers(agent)
             agent.run()
